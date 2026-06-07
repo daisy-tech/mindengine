@@ -2,6 +2,7 @@
 import { reactive, ref } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { ElMessage } from 'element-plus';
+import { formatApiError } from '@/api/errors';
 import { useAuthStore } from '@/stores/auth';
 
 const auth = useAuthStore();
@@ -23,6 +24,10 @@ async function submit() {
     ElMessage.warning('请输入邮箱和密码');
     return;
   }
+  if (mode.value === 'register' && form.password.length < 8) {
+    ElMessage.warning('密码至少 8 位');
+    return;
+  }
   loading.value = true;
   try {
     if (mode.value === 'register') {
@@ -38,13 +43,7 @@ async function submit() {
     const next = (route.query.next as string) || '/chat';
     await router.push(next);
   } catch (e: unknown) {
-    const msg =
-      e && typeof e === 'object' && 'response' in e
-        ? // axios error
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (e as any).response?.data?.detail ?? (e as any).message
-        : String(e);
-    ElMessage.error(msg || '请求失败');
+    ElMessage.error(formatApiError(e));
   } finally {
     loading.value = false;
   }
@@ -62,11 +61,11 @@ async function submit() {
         <el-form-item label="邮箱">
           <el-input v-model="form.email" autocomplete="email" />
         </el-form-item>
-        <el-form-item label="密码">
+        <el-form-item :label="mode === 'register' ? '密码（至少 8 位）' : '密码'">
           <el-input
             v-model="form.password"
             type="password"
-            autocomplete="current-password"
+            :autocomplete="mode === 'register' ? 'new-password' : 'current-password'"
             show-password
           />
         </el-form-item>
