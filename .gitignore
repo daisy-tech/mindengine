@@ -1,0 +1,41 @@
+## Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.coverage.*
+
+## IDE / OS
+.idea/
+.vscode/
+.DS_Store
+._*
+Thumbs.db
+
+## Env
+.env
+.env.*
+!.env.example
+
+## Backend runtime
+backend/data/
+backend/logs/
+backend/.eval/
+
+## Docker volumes (when running compose without explicit volumes)
+backend/pgdata/
+backend/redis-data/
+
+## Alembic temp
+backend/alembic/__pycache__/

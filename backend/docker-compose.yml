@@ -1,0 +1,72 @@
+## MindEngine local stack — Postgres + pgvector + Redis + backend + Celery (M1).
+##
+## Decision D1: episodic vectors are stored inside Postgres (pgvector),
+## so there's no separate vector DB service.
+
+name: mindengine
+
+x-backend-base: &backend-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: mindengine
+      POSTGRES_PASSWORD: mindengine
+      POSTGRES_DB: mindengine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mindengine -d mindengine"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    <<: *backend-base
+    environment:
+      RUNTIME_KIND: web
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  celery:
+    <<: *backend-base
+    environment:
+      RUNTIME_KIND: worker
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO"]
+
+  celery-beat:
+    <<: *backend-base
+    environment:
+      RUNTIME_KIND: worker
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "beat", "--loglevel=INFO"]
+
+volumes:
+  pgdata:
