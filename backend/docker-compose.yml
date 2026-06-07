@@ -88,5 +88,24 @@ services:
       RUNTIME_KIND: worker
     command: ["celery", "-A", "app.workers.celery_app:celery_app", "beat", "--loglevel=INFO"]
 
+  # M5 — 小白前端 (Vue3 + nginx)
+  # 与 backend 同一 compose network，nginx 反代 /api/* /auth/* /readyz
+  # 所以前端不需要 CORS 配置。开发热刷新仍走 host 上的 vite (5173)。
+  frontend:
+    image: mindengine-frontend:latest
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "5173:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/healthz || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
 volumes:
   pgdata:

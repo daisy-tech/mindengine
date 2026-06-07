@@ -13,6 +13,7 @@ message is saved.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
@@ -30,6 +31,12 @@ from app.api.deps import (
 from app.domain.route import Personality
 from app.infra.repositories import ConversationRepo, MessageRepo
 from app.services.chat import ChatRepos, StreamEvent
+
+# How often to emit an SSE comment heartbeat so intermediaries (nginx,
+# CloudFront, mobile NAT) don't reap an idle connection. Per
+# docs/rebuild/11-Roadmap.md M5 §3 — 15s is the safe upper bound for a
+# 60s proxy idle timeout.
+SSE_HEARTBEAT_SECONDS = 15.0
 
 ChatOrchFactory = Annotated[
     "object", Depends(build_chat_orchestrator_factory)
@@ -71,14 +78,42 @@ async def chat(
     async def stream() -> AsyncIterator[bytes]:
         # Initial SSE comment to flush headers / let proxies establish the connection.
         yield b": ok\n\n"
-        async for event in orchestrator.stream_chat(
+
+        # Race the orchestrator events against a periodic heartbeat tick.
+        # The heartbeat is just an SSE comment (";:" prefix) so the
+        # browser parser ignores it but proxies see traffic and don't
+        # close the connection.
+        events = orchestrator.stream_chat(
             user_id=user_id,
             conversation_id=body.conversation_id,
             user_message=body.message,
             repos=repos,
             personality=personality,
-        ):
+        ).__aiter__()
+
+        next_evt: asyncio.Task[Any] | None = None
+        while True:
+            if next_evt is None:
+                next_evt = asyncio.create_task(events.__anext__())
+            try:
+                done, _ = await asyncio.wait(
+                    {next_evt}, timeout=SSE_HEARTBEAT_SECONDS
+                )
+            except asyncio.CancelledError:
+                next_evt.cancel()
+                raise
+            if not done:
+                # Heartbeat tick — keep the line alive.
+                yield b": ping\n\n"
+                continue
+            try:
+                event = next_evt.result()
+            except StopAsyncIteration:
+                next_evt = None
+                break
+            next_evt = None
             yield _format_sse(event)
+
         yield b"event: done\ndata: {}\n\n"
 
     headers: dict[str, Any] = {
