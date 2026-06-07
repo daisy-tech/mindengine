@@ -3,6 +3,11 @@
 > 责任：让"内向/中性/外向"三种人格在 LLM 实际回复里**真的能感知差异**——不是写在文档里的形容词。
 > 输出：插入到 system prompt 里的契约段（每段 6 行内）。
 
+> 🔄 **修订 v1.1（2026-06）· 决策 D3**：模型对契约的服从率仅 ~70%（§10），而"三人格可感知差异"是核心卖点，不能只押在 LLM 自觉上。新增：
+> - §9.4 **后置确定性兜底**（字数硬截断 + 多余反问削除），作为不变式 17（[02-TDD.md](./02-TDD.md) §9）。
+> - §10 把"服从率保障"升级为 M2/M4 一等任务（含主聊模型选型实验，见 [11-Roadmap.md](./11-Roadmap.md)）。
+> - 验收口径改"统计带"，见 [01-PRD.md](./01-PRD.md) §7 验收 #3。
+
 ---
 
 ## 1. 设计原则
@@ -241,8 +246,36 @@ def test_signature_knowledge_task_skip():
 ### 9.3 不能这样改
 
 - ❌ 把字数指标改写成"短/中/长" → 失去可测性
-- ❌ 把契约从 prompt 移到代码后置处理 → LLM 失去主动遵循动机
+- ❌ 把契约从 prompt **移走、只**靠代码后置处理 → LLM 失去主动遵循动机
 - ❌ 让某 intent 跳过契约 → v0.97 大坑回归
+
+> 注意：§9.4 的后置兜底是在"契约仍完整保留在 prompt"基础上**额外加**的安全网，不是替代——与本条不矛盾。
+
+### 9.4 🔄 后置确定性兜底（v1.1 新增 · 决策 D3）
+
+**动机**：契约让 LLM"主动"遵循（首选），但服从率 ~70% 意味着约 30% 的轮次会越界。给一个**确定性下限**，保证"差异可感知"不依赖运气。
+
+**做法**（在 reply 落库前、流式 final 之前执行）：
+
+```python
+def enforce_contract(reply: str, route: MemoryRoute) -> str:
+    if route.intent == "knowledge_task":      # 与人格无关，不处理
+        return reply
+    limit = CHAR_LIMITS[route.personality]    # 30 / 60 / 90
+    reply = trim_to_sentence_boundary(reply, limit)   # 超长→按句界硬截断，不切半句
+    if route.personality == "introvert":
+        reply = strip_trailing_questions(reply)       # 内向：削掉结尾反问
+    return reply
+```
+
+**原则**：
+- **按句界截断**，不在句子中间砍（避免半句）。
+- 截断/削除发生时**记到 `prompt_meta`**（如 `contract_enforced: {truncated: true, removed_question: false}`），让评测能区分"LLM 自觉达标" vs "被兜底救回"——这是衡量模型服从率的关键数据。
+- 流式场景：可在流结束后对完整 reply 做一次 enforce，再发 `final`；或边流边估算字数、接近上限时提示前端"软停"。优先用"流后 enforce"，实现简单。
+
+**测试**：内向人格 LLM 输出 120 字 → enforce 后 ≤30 字且不以反问结尾；`prompt_meta.contract_enforced.truncated == true`。
+
+> 与 §7 评估的关系：`personality_signature` 应基于**enforce 之前**的原始 reply 判 LLM 服从率（衡量模型能力），而用户看到的是 enforce 之后的 reply（保证体验）。两份都进 `prompt_meta`。
 
 ---
 
@@ -255,10 +288,14 @@ def test_signature_knowledge_task_skip():
 | qwen-plus | ~60% | ~70% |
 | Claude 4.6 sonnet | 估 90%+（未实测） | 估 85%+ |
 
-**结论**：契约设计正确，但**模型服从率有限**——这是 v1.2.3 没解决的问题，新版可考虑：
-- 加 few-shot 示例（contract 段后跟 2-3 个理想样例）
-- 加后置硬截断（reply 超字数硬切）
-- 用更强模型
+**结论**：契约设计正确，但**模型服从率有限**——这是 v1.2.3 没解决的问题。
+
+> 🔄 **修订 v1.1（决策 D3）**：把"服从率保障"从"可考虑"升级为**一等任务**，三管齐下：
+> 1. **后置确定性兜底**（§9.4）——保证下限，已列为不变式 17。**M2 必做**。
+> 2. **主聊模型选型实验**——M2 末用 `personality_signature`（基于 enforce 前 reply）通过率做指标，A/B 对比 `CHAT` 角色候选（qwen3.7-max vs Claude/GPT 系），数据驱动选型，而非默认 qwen。见 [11-Roadmap.md](./11-Roadmap.md) M2。
+> 3. **few-shot**（contract 段后跟 2-3 个理想样例）——若 1+2 后服从率仍 < 80% 再加，避免无谓增 token。
+>
+> 验收口径同步改为统计带（[01-PRD.md](./01-PRD.md) §7 #3）：不再要求单轮硬达标，而看"≥80% 轮次落在契约字数带内 + 三人格字数中位数差 ≥ 30"。
 
 参考 [10-Lessons-Learned.md](./10-Lessons-Learned.md) §3.2。
 

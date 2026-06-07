@@ -9,6 +9,26 @@
 
 ---
 
+## 🔄 修订记录
+
+### rebuild v1.1（2026-06）· 架构评审后的关键决策
+
+> 本次修订基于一轮完整设计评审，落地以下结构性决策。各子文档已同步更新，并在对应位置标注 `🔄 修订 v1.1`。
+
+| # | 决策 | 影响文档 | 动机 |
+|---|---|---|---|
+| D1 | **存储统一为 Postgres + pgvector**，砍掉 SQLite / Mem0 / Qdrant；infra 简化为 **Postgres + Redis** | 02 / 05 / 08 / 09 / 11 | 单机 docker compose 下 Postgres 成本≈0，却一次性消灭坑 1.2 / 9.2 / 9.3 / 10.3，兑现"易迁"承诺，pgvector 让四层记忆+向量同库同事务，infra 净减一个服务 |
+| D2 | **流式持久化与客户端连接解耦**：只要 LLM 产出 ≥1 token，必落一条带 `prompt_meta` 的 message（哪怕客户端断连） | 02 §2.1 / §9 | 修复"断连即丢审计"漏洞，保住评测体系基石 |
+| D3 | **人格服从率改为"规则后置兜底 + 选型实验"保障**，验收口径改统计带 | 04 / 01 / 11 | 模型服从率仅 ~70%，不能把核心卖点押在 LLM 自觉上 |
+| D4 | **首字延迟拆显式预算 + 投机加载 + intent 可缓存** | 03 | 800ms 预算偏紧，intent 在关键路径串行 |
+| D5 | **L1 标红 turn 提前引入便宜小模型 judge**（幻觉/复述判断不靠脆弱正则） | 07 | 幻觉检测是核心承诺，纯规则不可靠 |
+| D6 | **补安全基线**：口令哈希算法、`DEV_MODE` 默认 false + 硬开关、数据隔离测试 | 08 / 09 | dev 端点能重置用户记忆，误配风险高 |
+| D7 | **数据迁移：✅ 策略 A 全弃**（从 0 开始，不迁 legacy 真实数据） | 08 §10 | 已定；真实聊天评估靠合成 case + 新攒会话补足 |
+| D8 | **模型 id 统一为常量表**、仓库结构澄清、`intent` 历史窗口口径统一、`≤7000 行` 降级为参考目标 | 09 / README / 03 | 消除命名漂移（坑 2.4 本身）与文档内自相矛盾 |
+| D9 | ✅ **头像资产已确认存在**：`docs/rebuild/xiaobai-avatar.png`（40KB/WebP/800×1448）| 12 | 初稿误报缺失，实际无需补齐 |
+
+---
+
 ## 命名约定（避免混淆）
 
 | 名称 | 含义 | 何时使用 |
@@ -17,7 +37,7 @@
 | **MindMem** | 旧项目/参考实现（本 monorepo 现有代码） | 仅指 legacy 代码、git tag `v0.97`、行为对齐基准 |
 | **小白（XiaoBai）** | AI 聊天伙伴名称（中文「小白」，英文 XiaoBai） | system prompt、前端 UI、用户可见文案 |
 | **MemoBot** | legacy AI 名称（**已废弃**） | 仅反查旧代码时使用，MindEngine 不得出现 |
-| `mindengine-server/` | 新后端仓库推荐目录名 | 新建独立 repo 时使用 |
+| `backend/`（旧称 `mindengine-server/`）| monorepo 内新后端代码根 | 🔄 v1.1：统一用 `backend/`，与前端 `frontend/` 同仓 |
 | `mindmem/` | legacy 仓库目录名（与 MindEngine 新项目无关） | 反查 legacy 代码路径时使用 |
 | `v0.97` / `v1.2.3` | **v0.97** = legacy 代码 git tag；**v1.2.3** = 功能完整度目标（人格契约、评估落盘等） | 两者指同一套参考实现，只是 tag 名 ≠ 功能版本号 |
 
@@ -64,7 +84,7 @@
 1. ❌ Prompt 组件耦合 `route` 对象，导致测试要构造大量样板
 2. ❌ 异步任务（Celery）写库与 Web 请求写库共用同一 SQLAlchemy 引擎，并发冲突
 3. ❌ `prompt_meta` 存储在 `Message.meta` 的子字段里，schema 漂移
-4. ❌ Mem0 / Qdrant 直接耦合在业务代码里，难替换难测
+4. ❌ Mem0 / Qdrant 直接耦合在业务代码里，难替换难测 → 🔄 v1.1：直接砍掉 Mem0/Qdrant，episodic 改 pgvector，仍走 EpisodicRepository 抽象（见 [08](./08-Data-Model.md) §3）
 5. ❌ 评测脚本和生产代码混在 `backend/scripts/`，部署上线要小心排除
 6. ❌ `_SECTION_HEADERS` 硬编码字符串匹配 prompt 段落，每次 prompt 改动就要同步改这里
 
@@ -72,8 +92,10 @@
 
 ## 推荐项目结构（MindEngine 新仓库）
 
+> 🔄 **修订 v1.1· 仓库结构澄清**：本项目仓库根即 `mindengine/`（当前 GitHub repo）。采用 **monorepo**：后端在 `backend/`（即下文结构，原 `mindengine-server/` 仅为目录名别称，统一用 `backend/`），前端在 `frontend/`。文中凡 `mindengine-server/` 一律理解为本仓库的 `backend/`。
+
 ```
-mindengine-server/             # MindEngine 新后端仓库根
+backend/                       # MindEngine 新后端代码根（monorepo 内）
 ├── app/
 │   ├── api/                   # FastAPI 路由层（薄）
 │   │   ├── chat.py
@@ -93,13 +115,13 @@ mindengine-server/             # MindEngine 新后端仓库根
 │   │   └── eval/              # 评测（合成 + 真实）
 │   ├── infra/                 # 基础设施适配层（可替换）
 │   │   ├── llm/               # LLM client 抽象（OpenAI 兼容 / Anthropic / 本地）
-│   │   ├── vector/            # Mem0 / Qdrant / 替代品抽象
-│   │   ├── db/                # SQLAlchemy / 迁移
+│   │   ├── vector/            # 🔄 v1.1: pgvector 适配（episodic 语义检索；Repository 抽象保留可替换性）
+│   │   ├── db/                # SQLAlchemy + Alembic（Postgres）
 │   │   └── queue/             # Celery / arq / 替代品抽象
 │   └── workers/               # 异步任务定义（依赖 services + infra）
 ├── tests/
 │   ├── unit/                  # 纯逻辑测试（无 DB / 无网络）
-│   ├── integration/           # 走 DB / mem0 的集成测试
+│   ├── integration/           # 走 Postgres / pgvector 的集成测试（testcontainers）
 │   └── fixtures/              # 评测 case + chat_audit 样本
 ├── scripts/                   # 一次性运维脚本（独立于 app/）
 ├── alembic/                   # DB schema 迁移
@@ -128,7 +150,7 @@ MindEngine 的设计文档要**独立可读**，但有不确定的地方可以�
 | 2 | 自测 100+ 项全过 | 移植 `selftest_p0.py` 到 MindEngine 并通过 |
 | 3 | 同一份合成 case，通过率 ≥ legacy MindMem | 跑 smoke 20 / full 50，对比 v0.97 baseline |
 | 4 | 真实聊天评估 L0/L1 报告字段完全对齐 | 对比同一份 `chat_audit_v1` 输出 |
-| 5 | 重写后核心代码 ≤ 7000 行 | wc -l app/services/ + app/domain/，对比 legacy ~10k |
+| 5 | 重写后核心代码精简（**参考目标** ~7000 行，非硬门槛） | wc -l app/services/ + app/domain/，对比 legacy ~10k。🔄 v1.1：降级为参考目标，避免为压行数写密集/聪明代码而牺牲可读性 |
 | 6 | services/ 层 100% 可在无 DB 环境跑 unit test | pytest tests/unit/ 不需要任何容器 |
 
 ---

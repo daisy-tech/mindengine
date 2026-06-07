@@ -3,7 +3,10 @@
 > 责任：把 legacy MindMem v0.97 实际遇到的所有真实问题列出来。MindEngine 重构者实现每个模块前，**对应章节必读**。
 > 优先级：🔥 = 大坑、必修；⚠️ = 中坑、强烈建议修；💡 = 小坑、可借鉴。
 
----
+> 🔄 **修订 v1.1（2026-06）· 存储栈变更带来的影响**：因改用 Postgres + pgvector（决策 D1），以下坑的"新做法"已更新：
+> - **1.2 / 9.2 / 9.3**：SQLite/NFS 锁、同用户 redis_lock 串行——Postgres 行级锁/MVCC 后**多数自然消失**，redis_lock 不再必需。
+> - **4.2**：Mem0 `infer=True` 稀释——已无 Mem0，事实抽取在 service 层 + pgvector 存储。
+> - 各条已就地标注 🔄。其余坑（prompt/人格/评估/SSE）不受存储变更影响，照修。
 
 ## 1. 架构与模块边界
 
@@ -31,16 +34,17 @@
 
 **v0.97 现状**：`backend/app/db.py` 单例 engine，FastAPI worker 和 Celery worker 都用它。
 
-**新版做法**：
-- Web 进程一个 engine（pool_size=10）
-- Celery worker 一个 engine（pool_size=2，按队列分）
+**新版做法**（🔄 v1.1：根因从"SQLite 文件锁"变为"连接池/故障隔离"，Postgres 下不再有 `database is locked`，但 engine 分离仍是好实践）：
+- Web 进程一个 engine（pool 较大）
+- Celery worker 一个 engine（pool 较小，按队列分）
 - 通过 `infra/db/factory.py` 按 `RUNTIME_KIND` env var 决定怎么构造
 
 ```python
 def make_engine(kind: Literal["web","worker"]):
+    # 🔄 v1.1: Postgres + asyncpg
     if kind == "web":
-        return create_engine(DB_URL, pool_size=10, pool_recycle=300)
-    return create_engine(DB_URL, pool_size=2, pool_recycle=60)
+        return create_async_engine(DATABASE_URL, pool_size=10, pool_recycle=300)
+    return create_async_engine(DATABASE_URL, pool_size=2, pool_recycle=60)
 ```
 
 ---
@@ -216,7 +220,7 @@ class Intent(str, Enum):
 
 **症状**：明明抽出来是"用户儿子叫小李"，Mem0 入库变成"用户家里有男性成员"——稀释。
 
-**修复**：调用 `mem0.add(text, user_id, infer=False)`。事实抽取在 service 层做完，Mem0 只负责存储和召回。
+**修复**：🔄 **v1.1：已无 Mem0**。事实抽取在 service 层（LLM）做完，直接 embedding → 写入 `episodic_memories`（pgvector）。这从根上消除了"向量层二次理解"的风险——向量层只存不想。详见 [05-Subsystem-Memory-Layers.md](./05-Subsystem-Memory-Layers.md) §5.2。
 
 ---
 
@@ -421,7 +425,7 @@ def strip_fences(s: str) -> str:
 
 **症状**：偶发 database locked。
 
-**修复**：SQLite 文件放容器本地 volume（`/app/data`），不挂 NFS。NFS 只挂 `/app/eval/exports/`（评测产物）。
+**修复**：🔄 **v1.1：改用 Postgres 后此坑不再适用**（无文件锁）。Postgres 数据放本地块存储 `pgdata` volume，**不放 NFS**；NFS 只挂 `/app/eval/exports/`（评测产物）。
 
 ---
 
@@ -429,13 +433,12 @@ def strip_fences(s: str) -> str:
 
 **症状**：用户连发 10 句 → 同一用户的 extract 任务并发抢 SQLAlchemy。
 
-**修复**：按 user_id routing key，同一用户串行：
+**修复**：🔄 **v1.1：Postgres 行级锁/MVCC 后，并发写不再相互破坏，redis_lock 不再必需**。若仍想限制同用户任务洪峰（避免抽取顺序错乱），用 Celery 按 user_id 的 routing key 把同用户任务投到同一队列/单 worker 顺序消费即可，比分布式锁更轻：
 
 ```python
-@celery_app.task(bind=True)
-def extract_memory_task(self, user_id, ...):
-    with redis_lock(f"extract:{user_id}", timeout=30):
-        ...
+# 🔄 v1.1：可选，按 user_id 路由保证顺序，而非 redis_lock 互斥
+extract_memory_task.apply_async(args=[user_id, ...],
+                                queue=f"extract")  # 同队列单并发即顺序
 ```
 
 ---
@@ -489,7 +492,7 @@ def extract_memory_task(self, user_id, ...):
 | # | 坑 | 影响 | 优先级 | 章节 |
 |---|---|---|---|---|
 | 1.1 | services 耦合 ORM/Celery/FastAPI | 不可测 | 🔥 | §1 |
-| 1.2 | Web 和 Celery 共用 engine | DB 锁 | 🔥 | §1 |
+| 1.2 | Web 和 Celery 共用 engine | DB 锁 | 🔥 | §1 · 🔄 Postgres 后降级为池/故障隔离 |
 | 1.3 | Router 函数胖 | 难改难测 | ⚠️ | §1 |
 | 1.4 | scripts 混入部署 | 镜像膨胀 | 💡 | §1 |
 | 2.1 | Memory Router query 稀释 | 召回降级 | 🔥 | §2 |
@@ -503,7 +506,7 @@ def extract_memory_task(self, user_id, ...):
 | 3.5 | L0 字符串匹配段标题 | false positive | ⚠️ | §3 |
 | 3.6 | GUIDE 与 CONTRACT 冲突 | 行为不稳 | 💡 | §3 |
 | 4.1 | Profile 类型漂移 | 读取报错 | 🔥 | §4 |
-| 4.2 | Mem0 infer=True 稀释 | 召回降级 | 🔥 | §4 |
+| 4.2 | Mem0 infer=True 稀释 | 召回降级 | 🔥 | §4 · 🔄 已无 Mem0，pgvector 只存不想 |
 | 4.3 | Relationship via 自环 | 前端崩 | ⚠️ | §4 |
 | 4.4 | Episodic 召回 limit 过滤后剩少 | 召回降级 | ⚠️ | §4 |
 | 4.5 | banned 不在 write 端过滤 | 数据污染 | ⚠️ | §4 |
@@ -524,8 +527,8 @@ def extract_memory_task(self, user_id, ...):
 | 8.2 | EventSource 无 Authorization | 不安全 | ⚠️ | §8 |
 | 8.3 | SSE 无心跳 | 断流 | 💡 | §8 |
 | 9.1 | docker 启动顺序未约束 | 启动失败 | ⚠️ | §9 |
-| 9.2 | SQLite on NFS | DB 锁 | ⚠️ | §9 |
-| 9.3 | Celery 同用户并发 | 写冲突 | 💡 | §9 |
+| 9.2 | SQLite on NFS | DB 锁 | ⚠️ | §9 · 🔄 Postgres 后不适用 |
+| 9.3 | Celery 同用户并发 | 写冲突 | 💡 | §9 · 🔄 MVCC 后 redis_lock 非必需 |
 | 10.1 | selftest 单文件 1300 行 | 难维护 | 🔥 | §10 |
 | 10.2 | Pydantic default=list bug | 类型错 | ⚠️ | §10 |
 | 10.3 | SQLite dialect 差异 | 集成失败 | ⚠️ | §10 |
@@ -540,9 +543,13 @@ def extract_memory_task(self, user_id, ...):
 
 - [ ] services 函数签名只接 Pydantic DTO，不接 Request / Session？
 - [ ] 该模块用的 Repository 已经定义 Protocol？
-- [ ] LLM 调用是否通过 LLMRouter？enable_thinking 是否默认 false？
+- [ ] LLM 调用是否通过 LLMRouter？enable_thinking 是否默认 false？模型 id 走 [09](./09-LLM-Strategy.md) §1 常量表？
 - [ ] 是否覆盖 §12 表里相关坑的修复？
-- [ ] 单元测试可以无容器跑通？
+- [ ] 单元测试可以无容器跑通？（集成测用 testcontainers 起 Postgres+pgvector）
 - [ ] PromptPack 输出结构化 sections，不靠字符串匹配？
 - [ ] 写盘后 chmod 0644？
 - [ ] 任何 schema 字段带 schema_version？
+- [ ] 🔄 v1.1：chat 链路是否保证"≥1 token 必落带 meta 的 message"（断连不丢，不变式 15）？
+- [ ] 🔄 v1.1：Repository 强制 user_id 且有跨用户隔离测试（不变式 16）？
+- [ ] 🔄 v1.1：人格回复有后置兜底（超长截断/内向削反问，不变式 17）？
+- [ ] 🔄 v1.1：改数据的 dev 端点是否在 `DEV_MODE` 之外另加硬开关 + allowlist？

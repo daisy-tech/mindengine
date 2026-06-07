@@ -4,6 +4,11 @@
 > A. **合成评测**：手写 case + 跑全流程对比 expected
 > B. **真实聊天评估**：拿真实历史会话跑 L0 结构 + L1 启发式 + 归因
 
+> 🔄 **修订 v1.1（2026-06）· 决策 D5**：
+> - L0 + L1 仍是 **0 LLM 成本**的全量粗筛（默认路径不变）。
+> - 但"幻觉/复述"这类**语义判断**靠脆弱正则不可靠（坑 6.1/6.2/6.3），且这恰是核心承诺。新增 §3.3a：**对 L1 标红（fail/suspicious）的少量 turn，提前引入便宜小模型 `JUDGE` 复核**（从 v1.3 提前到 v1）。成本可控（只判 flagged turn）。
+> - §3.3：`fabrication_under_challenge` 的实体字典改为**结构化已知实体**（profile.basic + relationships.name + banned），不依赖对 episodic 做中文 NER。
+
 ---
 
 ## 1. 两条路径对比
@@ -187,6 +192,30 @@ def rule_xxx(turn: dict, prev_turn: dict | None, pack_context: dict) -> RuleResu
     返回：{id, status: pass|fail|suspicious|skip, severity, detail, attribution}
     """
 ```
+
+> 🔄 **v1.1 · `fabrication_under_challenge` 实体字典来源（决策 D5）**：不要对 episodic 做中文 NER（无模型 NER 不可靠，坑 6.3）。字典 = **结构化已知实体**：`profile.basic`（姓名/地名）+ `relationships.name` + `banned_entities`。reply 中出现"具体地名/人名"但不在该字典、也不在本轮 `activated` 池 → suspicious，交 §3.3a 的 `JUDGE` 复核。
+
+### 3.3a 🔄 标红 turn 的小模型复核（v1.1 新增 · 决策 D5）
+
+**动机**：L1 正则对"幻觉/未复述/偏题"是粗筛，误报漏报都有（坑 6.1/6.2/6.3）。全量上 LLM judge 太贵，但**只对 L1 标红的 turn** 复核，量小、成本可控，且这些 turn 恰是最该看准的。
+
+**流程**：
+
+```
+for turn in turns:
+    l1 = run_l1_rules(turn)             # 0 LLM，全量
+    if JUDGE_ENABLED and l1.has_flag(("fail","suspicious"), severity>=high):
+        verdict = judge(turn)            # 便宜 JUDGE 模型，语义判 1 次
+        turn.review.judge = verdict      # {agrees: bool, corrected_status, reason}
+```
+
+- 模型：`JUDGE`（见 [09-LLM-Strategy.md](./09-LLM-Strategy.md) §1 常量表，便宜档）。
+- 默认 `JUDGE_ENABLED=false`，可按需在评测时打开（真实聊天评估默认仍 0 LLM；想要更准时显式开）。
+- judge 只**复核/降噪**，不覆盖 L0 high fail（结构问题确定性高）。
+- 复核结果进 `review.judge`，并参与 `final_status`：L1 标 suspicious 但 judge 判 OK → 降为 ok；L1 漏报但 judge 判幻觉 → 升 bad。
+- 成本：仅 flagged turn × 1 次便宜调用，一个会话通常 < 5 次。
+
+**测试**：mock judge 返回 `agrees=false` → flagged turn 的 final_status 被 judge 修正。
 
 ### 3.4 归因体系
 
@@ -374,9 +403,9 @@ services/eval_chat_review/
 | 项 | v1 | v2 |
 |---|---|---|
 | 启发式规则数 | 11+ | 20+ |
-| LLM Judge | 不启用（成本） | 对启发式 fail 的 turn 调小模型语义判分 |
+| LLM Judge | 🔄 v1.1：**对 L1 标红 turn 可选复核**（§3.3a，默认关、按需开） | 全量语义判分 / 多 judge 投票 |
 | 跨会话趋势 | 单会话 | 用户级评分卡 + trend |
-| 实体词典 | 硬编码 | 从 user_profile.relationships 动态加载 |
+| 实体词典 | 🔄 v1.1：profile.basic + relationships.name + banned（结构化）| 从 episodic 做模型 NER 扩充 |
 | 报告对比 | 单次 | v0.96 vs v0.97 自动 diff |
 
 ---

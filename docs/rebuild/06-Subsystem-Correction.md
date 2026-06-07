@@ -3,6 +3,8 @@
 > 责任：用户在对话中说"不对，是 X" → AI 立刻软删错的记忆 + 实体硬封禁 + 复述用户事实。
 > 不能简单地"打个 deprecated 标签就完事"——必须三层联动 + 防回流。
 
+> 🔄 **修订 v1.1（2026-06）**：episodic 软删从"Mem0 不删 + deprecation 表"改为 `episodic_memories.status='deprecated'` + deprecation 表（同库事务，决策 D1）。§4 Step 2 的 `search_episodic` 走 pgvector；§6.5 banned 近邻匹配 v2 可直接复用 pgvector，无需引第三方。模型 id 引用 [09](./09-LLM-Strategy.md) §1 常量表（`CORRECTION`）。
+
 ---
 
 ## 1. 设计目标
@@ -91,7 +93,7 @@ correction_cleanup_task(message_id):
         if judgement.confidence < CORRECTION_CONFIDENCE_THRESHOLD (0.7):
             _apply_audit_only(cand, judgement)  # 仅审计
         elif cand.source == "episodic":
-            _apply_episodic(cand, judgement)     # mem0.soft_delete + deprecation 表
+            _apply_episodic(cand, judgement)     # episodic.status='deprecated' + deprecation 表（pgvector）
         elif cand.source == "event":
             _apply_event(cand, judgement)        # event.status='deprecated'
         elif cand.source == "profile":
@@ -154,7 +156,7 @@ class BannedEntity(Base):
 
 ### 6.2 写入时过滤
 
-extract_* 任务在调 `mem0.add(...)` 前：
+extract_* 任务在写入 episodic（pgvector）前：
 
 ```python
 banned = await banned_repo.list(user_id)
@@ -162,7 +164,7 @@ for fact in extracted_facts:
     if text_hits_banned(fact, banned):
         logger.info("skip banned entity write: %s", fact)
         continue
-    mem0.add(fact, user_id=user_id, infer=False)
+    await episodic_repo.add(user_id, fact, metadata)   # 🔄 v1.1：内部 embedding → INSERT episodic_memories
 ```
 
 ### 6.3 读取时过滤
@@ -188,7 +190,7 @@ v0.97 用子串匹配判断"text hits banned"。问题：
 - "岳西" ban 后，"岳西县" 仍命中（OK）
 - 但 "我喜欢学姐" 含 "学" 与 ban 的 "学渣" 误命中
 
-v2 改用 embedding 相似度 + 阈值，更准。
+v2 改用 embedding 相似度 + 阈值，更准。🔄 v1.1：由于 episodic 已在 pgvector，banned 实体的 embedding 近邻判断**可直接复用同库 pgvector**（无需引第三方向量库），落地成本更低。
 
 ---
 
@@ -231,7 +233,7 @@ INTENT_GUIDES["correction"] = """【纠错指引】
 
 | 用例 | 验证 |
 |---|---|
-| episodic 软删 | `_apply_episodic` 落一条 deprecation + mem0.soft_delete 被调用 |
+| episodic 软删 | `_apply_episodic` 落一条 deprecation + episodic.status 置 deprecated（pgvector 行） |
 | 低置信走 audit_only | confidence=0.3 → action="audit_only"，记忆仍存在 |
 | banned 持久化 | `_apply_banned_entities(["岳西"," "])` → 表里只有 "岳西" |
 | banned 去重 | 重复 apply 不重复入表 |
@@ -261,7 +263,7 @@ SELECT * FROM banned_entities WHERE user_id = ? ORDER BY created_at DESC;
 
 ```sql
 UPDATE memory_deprecations SET restored_at = NOW() WHERE id = ?;
--- 同步调用 mem0.restore(mem_id)
+-- 🔄 v1.1：同步 UPDATE episodic_memories SET status='active' WHERE id = ?
 -- 同步 event.status='active'
 ```
 

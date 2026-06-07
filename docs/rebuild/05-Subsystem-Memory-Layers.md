@@ -3,6 +3,10 @@
 > 责任：把"AI 知道用户什么"分成 4 层 schema，各有写入时机、读取规则、合并策略。
 > 这是 MindEngine 区别于"长上下文聊天"的根本所在。
 
+> 🔄 **修订 v1.1（2026-06）**：episodic 存储从 Mem0+Qdrant 改为 **Postgres + pgvector**（决策 D1/D4）。
+> 四层记忆现在**全在 Postgres**，§5 已重写；EpisodicRepository 接口不变（抽象仍在），仅实现从 mem0 换成 pgvector。
+> 另新增 §11.x 渐进启用策略（决策 D8，避免组合复杂度拖住 M2）。
+
 ---
 
 ## 1. 为什么是四层不是一层
@@ -20,10 +24,10 @@
 
 | 层 | 形状 | 存储 | 典型字段 |
 |---|---|---|---|
-| **profile** | 单条 JSON | SQLite 一行/用户 | basic / interests / occupation / location / family_structure |
-| **event** | 多条 | SQLite | id, user_id, type, title, content, occurred_at, status, source_message_id |
-| **episodic** | 多条 | Mem0 + Qdrant | text, score, metadata{user_id, ts, source} |
-| **relationship** | 图状 | SQLite | id, user_id, name, role, attributes_json, via |
+| **profile** | 单条 JSON | Postgres 一行/用户 | basic / interests / occupation / location / family_structure |
+| **event** | 多条 | Postgres | id, user_id, type, title, content, occurred_at, status, source_message_id |
+| **episodic** | 多条 | 🔄 Postgres + pgvector | id, user_id, text, embedding(vector), status, source |
+| **relationship** | 图状 | Postgres | id, user_id, name, role, attributes_json, via |
 
 ---
 
@@ -111,11 +115,13 @@ class Event(BaseModel):
 
 ---
 
-## 5. episodic（Mem0 / Qdrant）
+## 5. episodic（🔄 Postgres + pgvector）
+
+> 🔄 **修订 v1.1**：取代 Mem0/Qdrant。事实抽取在 service 层（`extract_memory_task` 用 LLM）做完，向量层只负责"存 + 近邻召回"——这正是 legacy 关掉 `infer`（坑 4.2）后 Mem0 实际承担的角色，所以 pgvector 完全够用且更可控。
 
 ### 5.1 形状
 
-每条 episodic = 一段从对话里抽出的"事实片段"，带 embedding。
+每条 episodic = 一段从对话里抽出的"事实片段" + 其 embedding，落 `episodic_memories` 表（见 [08-Data-Model.md](./08-Data-Model.md) §2.3）。
 
 例子：
 ```
@@ -126,23 +132,41 @@ class Event(BaseModel):
 
 ### 5.2 写入
 
-Celery `extract_memory_task` → 调用 `mem0.add(text, user_id=...)` → Mem0 内部走 LLM 做事实抽取 + dedup + 写入 Qdrant。
+Celery `extract_memory_task`：
+1. LLM 抽取出干净的事实片段列表（service 层，**等价 legacy 的 infer=False 语义**：不让向量层二次"理解"）。
+2. 写入前过 `banned_entities`（坑 4.5：write 端也要过滤）。
+3. 对每条 `text` 算 embedding（`EMBEDDING_MODEL`，dim=1024）。
+4. `INSERT INTO episodic_memories (id, user_id, text, embedding, status, source, ...)`。
 
-**关键**：`infer=False` 让 Mem0 不二次抽取（v0.97 教训：infer=True 时 Mem0 会把已抽好的事实再"理解"一遍，引入噪音）。
+```python
+async def add(self, user_id: str, text: str, metadata: dict) -> str:
+    if text_hits_banned(text, await self.banned_repo.list(user_id)):
+        return ""  # 跳过（坑 4.5）
+    vec = await self.embedder.embed(text)
+    return await self._insert(user_id, text, vec, metadata)
+```
 
 ### 5.3 读取
 
-`mem0.search(query, user_id=..., limit=N)` → 按相似度返回。
+pgvector 近邻检索（按 user_id + status 预过滤，见 08 §3.3）：
 
-**过滤步骤**（在 service 层做，不依赖 Mem0）：
-1. 排除 `deprecated_episodic_ids`（来自 memory_deprecations 表）
-2. 排除文本命中 `banned_entities` 的条目
-3. 按 usage 标签分桶（EXPLICIT_OK / BACKGROUND_ONLY / ...）
+```python
+async def search(self, user_id: str, query: str, limit: int) -> list[EpisodicHit]:
+    qvec = await self.embedder.embed(query)
+    rows = await self._knn(user_id, qvec, limit=limit * 2)  # *2 留过滤余量（坑 4.4）
+    return rows
+```
+
+**过滤步骤**（service 层）：
+1. `status='deprecated'` 已在 SQL 排除（取代 legacy 的 deprecated_episodic_ids 列表）。
+2. 排除文本命中 `banned_entities` 的条目。
+3. 按 usage 标签分桶（EXPLICIT_OK / BACKGROUND_ONLY / ...）。
 
 ### 5.4 数量管理
 
-- 每用户上限：建议 2000 条（超出后定期 compact）
-- 单次 retrieval 上限：limit \* 2（为后续过滤留余量）
+- 每用户上限：建议 2000 条（超出后定期 `compact_memories`：合并相似条目 + `VACUUM`）。
+- 单次 retrieval 上限：limit × 2（为后续过滤留余量）。
+- pgvector 索引：HNSW（`vector_cosine_ops`）；数据量小时 ivfflat 也可。
 
 ---
 
@@ -227,7 +251,7 @@ class RelationshipRepository(Protocol):
     ...
 ```
 
-API/Service 层依赖 Protocol，infra 层实现具体存储。便于换 Mem0 → Chroma / 换 SQLite → Postgres。
+API/Service 层依赖 Protocol，infra 层实现具体存储。🔄 v1.1：当前实现 = Postgres（关系）+ pgvector（episodic）；Protocol 抽象保留可替换性（如未来换专用向量库 / 换 RDBMS）。
 
 ### 8.2 memory_context.load 的并发
 
@@ -292,11 +316,26 @@ async def load(self, user_id: str, route: MemoryRoute) -> MemoryContext:
 | Episodic 过滤 banned/deprecated | 散在 memory_context.py | filter.py 独立纯函数 |
 | Relationship via=self 校验 | 修复后才加 | domain 层 validator |
 | 4 层并发拉 | 串行 | asyncio.gather 并发 |
-| 替换 Mem0 难度 | 高（耦合死） | Repository 抽象，可替换 |
+| episodic 存储 | Mem0 + Qdrant（独立服务）| 🔄 Postgres + pgvector（同库）|
+| 向量层耦合 | Mem0 耦合死 | EpisodicRepository Protocol，实现可换 |
 
 ---
 
-## 11. 演化方向
+## 11. 🔄 渐进启用策略（v1.1 新增 · 决策 D8）
+
+> 9 intents × 3 personality × 4 memory_depth × 3 event_policy × 4 usage_tag 是个大状态空间，穷举测试不现实。为避免 M2 被组合复杂度拖住，建议**先打通闭环，再按评测数据加**。
+
+| 阶段 | 启用范围 |
+|---|---|
+| M2 先跑通 | 高频 4-5 个 intent（casual / memory_challenge / correction / relationship_topic / emotional_support）+ 2 档 depth（minimal / focused）|
+| M3 补齐 | 其余 intent + wide/safe_focused depth + 全部 event_policy |
+| 后续 | usage_tag 的 FOLLOW_UP_ONCE / AVOID_UNLESS_ASKED 视评测需要再细化 |
+
+**原则**：每加一个 intent/depth，配套加 selftest case + 跑 smoke，确认通过率不降。**严格复刻 v0.97 全 9 类是 M4 的目标，不是 M2 的前提**。
+
+---
+
+## 12. 演化方向
 
 - v2：episodic 加 importance score（不是所有事实都同等权重）
 - v2：events 加 entity link（自动关联到 relationship）

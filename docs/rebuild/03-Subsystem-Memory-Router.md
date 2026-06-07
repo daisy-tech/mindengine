@@ -3,6 +3,11 @@
 > 责任：在每轮回复前，决定"这一轮该装哪几层记忆、最多几条、是否敏感模式"。
 > 输出：`MemoryRoute` 对象。
 
+> 🔄 **修订 v1.1（2026-06）**：
+> - §4.4：**intent 历史窗口口径统一为"最近 2 轮 user+assistant"**（决策 D8，原文档 2/2-3 轮不一致）。注意这与 §5.4 的"episodic query 只用当前消息"是**两件事**：前者喂给分类器判 intent，后者喂给向量检索，不要混。
+> - §8：首字延迟拆**显式预算表 + 投机加载 + intent 缓存**（决策 D4，800ms 偏紧且 intent 在关键路径串行）。
+> - §5.2 后追加渐进启用提示（决策 D8，见 [05](./05-Subsystem-Memory-Layers.md) §11）。
+
 ---
 
 ## 1. 三层架构
@@ -18,7 +23,7 @@
                   ▼
 ┌──────────────────────────────────────────┐
 │ Layer 2: 小模型 intent 分类                │
-│   - Qwen3.7-plus (或同档结构化模型)          │
+│   - qwen3.7-plus (INTENT 常量/同档结构化)     │
 │   - JSON 输出，temperature=0                │
 │   - 输入：当前消息 + 最近 2-3 轮            │
 │   - 输出：intent + confidence + reason      │
@@ -141,9 +146,11 @@ def match_hard_rule(message: str) -> HardRuleHit | None:
 - 模型偶尔会用 ` ```json {...} ``` ` 包裹，要剥
 - intent 不在 9 类内则兜底 `casual`
 
-### 4.4 历史窗口
+### 4.4 历史窗口（🔄 v1.1 统一口径）
 
-只取最近 2-3 轮 user+assistant，足够判断上下文，不要把整个会话塞进去（成本+稀释）。
+**intent 分类**喂 **最近 2 轮 user+assistant**（足够判断上下文，不要塞整个会话——成本+稀释）。
+
+> 🔄 口径统一：本节、§4.2 prompt 模板、intent cache key 一律按"最近 2 轮"。**勿与 §5.4 混淆**——§5.4 是 episodic 向量检索的 query 构建，只用当前消息（必要时拼上一句），与喂分类器的历史窗口是两条独立逻辑。
 
 ---
 
@@ -181,6 +188,8 @@ class MemoryRoute(BaseModel):
 | knowledge_task | minimal | profile_basic | 0 | F | none |
 
 > 这是 v0.97 验证过的稳定值。新版可微调，但**先复刻一致再说**。
+>
+> 🔄 v1.1（决策 D8）：M2 阶段可**先启用高频 4-5 个 intent + 2 档 depth** 打通闭环，其余按评测数据渐进加；严格复刻全 9 类是 M4 目标。详见 [05-Subsystem-Memory-Layers.md](./05-Subsystem-Memory-Layers.md) §11。
 
 ### 5.3 `sensitive_mode` 用途
 
@@ -282,6 +291,8 @@ class MemoryRouter:
 
 ## 8. 性能与成本
 
+### 8.1 router 自身开销
+
 | 阶段 | 期望 |
 |---|---|
 | Layer 1（regex）| < 1ms |
@@ -289,7 +300,30 @@ class MemoryRouter:
 | Layer 3（dict lookup）| < 1ms |
 | 总 router 开销 | ≤ 350ms p95 |
 
-成本：单轮 ~150 input tokens + ~30 output tokens × qwen-plus ≈ $0.0001 / 轮
+成本：单轮 ~150 input tokens + ~30 output tokens × `INTENT` 模型 ≈ $0.0001 / 轮
+
+### 8.2 🔄 首字延迟预算（v1.1 · 决策 D4）
+
+**问题**：PRD §5.1 首字 ≤ 800ms。但 `load_layers` 依赖 intent，所以 **intent LLM 调用卡在关键路径上串行**（hard rule 未命中时）：intent(300ms) → 记忆加载 + 向量检索 → compose → 主聊 TTFT。串起来 800ms 很紧。把总预算拆开看：
+
+| 阶段 | p50 预算 | p95 预算 | 说明 |
+|---|---|---|---|
+| Layer 1 硬规则 | <1ms | <1ms | 命中则跳过 intent LLM |
+| Layer 2 intent LLM | 150ms | 300ms | 未命中硬规则时 |
+| 记忆加载（4 层并发 + pgvector 检索）| 40ms | 120ms | asyncio.gather |
+| compose | <5ms | 10ms | 纯字符串 |
+| 主聊 TTFT | 250ms | 450ms | 取决于 `CHAT` 模型 |
+| **合计（硬规则命中）** | ~300ms | ~580ms | 跳过 intent LLM |
+| **合计（走 intent LLM 串行）** | ~450ms | ~880ms | ⚠️ p95 略超 800ms |
+
+### 8.3 🔄 优化手段（按收益排序）
+
+1. **硬规则尽量多覆盖典型句**：命中即省掉 intent LLM 那 150-300ms（已是设计原则，§3）。
+2. **intent 缓存**（决策 D4）：intent 分类是确定性纯函数（temperature=0），`INTENT_CACHE_ENABLED=true` 生产可安全开。key = `sha1(normalized_message + last_2_turns)`。命中直接省 Layer 2。
+3. **投机加载（speculative load）**：未命中硬规则时，**不等 intent 返回**，先用一个"保守超集 `load_layers`"（如 profile_basic + episodic top-k）并发预拉记忆；intent 回来后按真实 route 裁剪/补拉。把"向量检索墙钟"与"intent LLM 墙钟"重叠，p95 可压回 800ms 内。
+   - 代价：偶尔多拉一点点记忆（被裁掉），成本可忽略。
+   - 实现：`asyncio.gather(intent_task, speculative_load_task)`，intent 到达后 reconcile。
+4. **本地小分类器（v2 候选）**：embedding/小模型本地分类，进一步砍 intent 延迟（见 §11 FAQ）。
 
 ---
 

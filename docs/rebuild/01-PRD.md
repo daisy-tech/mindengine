@@ -1,8 +1,10 @@
 # MindEngine · 产品需求文档（PRD）
 
-> 版本：rebuild · v1.0 · **MindEngine**
+> 版本：rebuild · v1.1 · **MindEngine**
 > 行为基准：legacy MindMem v0.97 参考实现
 > 受众：产品 / 工程负责人 / MindEngine 重构实施者
+
+> 🔄 **修订 v1.1（2026-06）**：本文档涉及——§4.2 存储改为 Postgres + pgvector（决策 D1）；§7 验收 #3 人格契约改统计口径（决策 D3）。完整决策见 [README.md](./README.md) 修订记录。
 
 ---
 
@@ -101,14 +103,14 @@
 
 | 层 | 存储 | 写入时机 | 读取时机 | 例子 |
 |---|---|---|---|---|
-| **profile** | SQLite JSON | 异步任务（Celery） | 几乎每次 | 姓名、出生年、所在地、职业 |
-| **event** | SQLite | 异步任务 | 按 intent | "上周和儿子吃饭"、"今天面试" |
-| **episodic** | Mem0 + Qdrant | 异步任务 | 按 intent | 散在对话里的零碎事实片段 |
-| **relationship** | SQLite | 异步任务 | 关系话题时 | "妻子叫张三"、"儿子上小学" |
+| **profile** | Postgres JSON | 异步任务（Celery） | 几乎每次 | 姓名、出生年、所在地、职业 |
+| **event** | Postgres | 异步任务 | 按 intent | "上周和儿子吃饭"、"今天面试" |
+| **episodic** | 🔄 Postgres + pgvector | 异步任务 | 按 intent | 散在对话里的零碎事实片段 |
+| **relationship** | Postgres | 异步任务 | 关系话题时 | "妻子叫张三"、"儿子上小学" |
 
-**写入分工**：
-- 同步任务（chat handler 之内）：**只**写 SQLite 的 Message / Conversation
-- 异步任务（Celery worker）：写四层记忆，避免阻塞流式回复
+**写入分工**（🔄 v1.1）：
+- 同步（chat 请求生命周期内、且与客户端连接解耦，见 [02-TDD.md](./02-TDD.md) §2.3）：写 Message / Conversation + prompt_meta
+- 异步（Celery worker）：写四层记忆，避免阻塞流式回复
 
 ### 4.3 F-03 智能记忆装填（Memory Router v1.5）
 
@@ -116,7 +118,7 @@
 
 **解法**：三层路由
 1. **硬规则**：识别 `correction` / `knowledge_task` 等明显意图
-2. **小模型 intent 分类**（Qwen3.7-plus）：补充判断 `casual` / `emotional_support` / `memory_challenge` 等
+2. **小模型 intent 分类**（`INTENT` 模型 = qwen3.7-plus）：补充判断 `casual` / `emotional_support` / `memory_challenge` 等
 3. **策略查表**：根据 intent 决定"该装哪几层、最多几条、是否敏感模式"
 
 **关键决策**：
@@ -271,7 +273,7 @@ Day 5+ 长期使用 → event 时间线累积 → 用户能看到"我和 AI 共�
 |---|---|---|
 | 1 | 四层记忆都跑通 | 创建一个新用户，聊 10 轮，4 层都有数据 |
 | 2 | Memory Router 不会漏 correction | 给 5 句明显纠错语，5/5 识别为 correction |
-| 3 | 人格契约真的生效 | 三种人格各跑 10 轮，回复字数中位数差异 ≥ 30 字 |
+| 3 | 人格契约真的生效 | 🔄 v1.1（统计口径）：三种人格各跑 ≥20 轮，(a) 三人格回复字数中位数两两差 ≥ 30 字；(b) 每种人格 ≥ 80% 轮次落在其契约字数带内（含 §9.4 后置兜底）。详见 [04-Subsystem-Personality.md](./04-Subsystem-Personality.md) §9.4/§10 |
 | 4 | 在线纠错有效 | 让 AI 说错老家，纠正后再问 5 次，5 次都说正确答案 |
 | 5 | 评测实验室能跑 | smoke 20 通过率 ≥ 90% |
 | 6 | 真实聊天评估对齐 | 同一份 `chat_audit_v1` 跑 review 字段完全一致 |

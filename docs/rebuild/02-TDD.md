@@ -1,8 +1,14 @@
 # MindEngine · 技术设计文档（TDD）
 
-> 版本：rebuild · v1.0 · **MindEngine**
+> 版本：rebuild · v1.1 · **MindEngine**
 > 与 [01-PRD.md](./01-PRD.md) 对位
 > 颗粒度：**架构级**——讲清楚边界、数据流、关键决策。具体实现交给重构者发挥。
+
+> 🔄 **修订 v1.1（2026-06）**本次涉及本文档：
+> - §1.1 / §8：infra 栈改为 **Postgres + pgvector + Redis**（去 SQLite/Mem0/Qdrant，决策 D1）。
+> - §2.1 / §9：**流式持久化与客户端连接解耦**——只要 ≥1 token 产出必落带 meta 的 message（决策 D2，修复断连丢审计漏洞）。
+> - §3.1：重写"为什么 Postgres"。
+> - §7：`DEV_MODE` 默认 `false` + dev 端点硬开关（决策 D6）。
 
 ---
 
@@ -38,8 +44,8 @@
 ┌─────────────────────────────────────────────────────┐
 │  Infrastructure (可替换适配层)                        │
 │  ├─ llm/    OpenAI 兼容 / Anthropic / 本地           │
-│  ├─ vector/ Mem0+Qdrant / 替换 Chroma / 替换 PG      │
-│  ├─ db/     SQLAlchemy + Alembic                     │
+│  ├─ vector/ pgvector (episodic)  🔄 v1.1            │
+│  ├─ db/     SQLAlchemy + Alembic (Postgres) 🔄      │
 │  └─ queue/  Celery / arq                             │
 └─────────────────────────────────────────────────────┘
                          │
@@ -62,7 +68,7 @@
 | `infra/` | `domain/` | `services/`、`api/` |
 | `workers/` | `services/`、`infra/` | `api/` |
 
-**核心收益**：80% 的代码（services + domain）可以**完全在内存里跑 pytest**，不需要起 Postgres / Qdrant / Redis。
+**核心收益**：80% 的代码（services + domain）可以**完全在内存里跑 pytest**，不需要起 Postgres / Redis。
 
 ---
 
@@ -80,14 +86,14 @@
    3.1 memory_router.route(message, personality, history)
        → MemoryRoute { intent, depth, load_layers, ... }
        Layer 1：硬规则（regex / 关键词，命中即返回）
-       Layer 2：小模型 intent 分类（Qwen3.7-plus，JSON 输出）
+       Layer 2：小模型 intent 分类（`INTENT` 模型 = qwen3.7-plus，JSON 输出）
        Layer 3：策略查表（intent → depth / max_explicit / sensitive_mode）
 
    3.2 memory_context.load(user_id, route)
        → MemoryContext { stable_profile, relevant_*, background_only }
-       并发拉四层：profile (SQLite) / event (SQLite) / episodic (Mem0)
-                  / relationship (SQLite)
-       过滤 banned_entities + deprecated_ids
+       并发拉四层（均在 Postgres）：profile / event / relationship (SQL)
+                  / episodic (pgvector 近邻检索)        🔄 v1.1
+       过滤 banned_entities + deprecated（status='active'）
        为每条记忆打 usage 标签（EXPLICIT_OK / BACKGROUND_ONLY / ...）
 
    3.3 prompt_composer.compose(memory_context, personality)
@@ -103,19 +109,55 @@
 
 4. API 层 wrap 成 SSE event，吐给前端
 
-5. 流结束后（同步，在请求生命周期内）：
-   5.1 把 reply 持久化到 Message 表
+5. 持久化（🔄 v1.1：与客户端连接解耦，见 §2.3）：
+   5.1 把 reply（哪怕是 partial）持久化到 Message 表
    5.2 把 PromptPack.meta 序列化到 Message.meta_json (TEXT 字段)
-       —— 关键：这一步要可靠，否则真实聊天评估失去基础
+       —— 关键：这一步必须在 finally / asyncio.shield 中执行，
+          客户端断连也要落库，否则真实聊天评估失去基础
 
-6. 流结束后（异步，dispatch Celery task）：
+6. dispatch Celery task（同样在 shield 中，不依赖客户端是否还在）：
    6.1 if intent != "correction":
-       - extract_memory_task  (Mem0)
-       - extract_profile_task (LLM 抽取 + 合并到 SQLite)
-       - extract_event_task   (LLM 抽取 + SQLite)
+       - extract_memory_task  (写 episodic / pgvector)
+       - extract_profile_task (LLM 抽取 + 合并到 Postgres)
+       - extract_event_task   (LLM 抽取 + Postgres)
    6.2 if intent == "correction":
        - correction_cleanup_task（管线见 §6.6）
 ```
+
+### 2.3 🔄 流式持久化的连接解耦（v1.1 · 决策 D2）
+
+**问题（修复前）**：`chat_orchestrator.stream` 是 async generator，"流结束后落库"写在生成器尾部。若用户**中途关页面 / 断网**，生成器被取消/GC，落库与 dispatch 都不执行——这条 turn 的 `prompt_meta` 永久丢失，而它是评测体系的基石（坑外新增，比坑 7.3 "LLM 报错"更隐蔽）。
+
+**不变式**：**只要 LLM 产出 ≥ 1 token，就必须有一条带 `meta_json` 的 message 落库**（成功=完整 reply；中断=partial reply + error 字段）。
+
+**实现要点**：
+
+```python
+async def stream(self, req) -> AsyncIterator[ChatEvent]:
+    route = await self.memory_router.route(...)
+    ctx   = await self.memory_context.load(...)
+    pack  = self.prompt_composer.compose(ctx, ...)
+    partial: list[str] = []
+    err: str | None = None
+    try:
+        async for tok in self.llm.stream(pack.system, ...):
+            partial.append(tok)
+            yield ChatEvent.delta(tok)
+    except (asyncio.CancelledError, Exception) as e:
+        err = type(e).__name__ if isinstance(e, Exception) else "client_disconnect"
+        # 不吞 CancelledError 的取消语义，但要保证 finally 落库
+        raise
+    finally:
+        reply = "".join(partial)
+        if reply or err:
+            # shield：即便外层任务被取消，落库与 dispatch 也跑完
+            await asyncio.shield(self._persist_and_dispatch(req, route, pack, reply, err))
+    yield ChatEvent.final(reply, pack.meta)
+```
+
+- `_persist_and_dispatch` 内部用 **worker engine / 独立 session**（不复用可能已随请求关闭的 session）。
+- dispatch 用 fire-and-forget 语义（不让用户等任务入队）。
+- 测试：mock LLM 产出 3 token 后抛 `CancelledError` → 断言 message 落库且 `error` 非空、`meta_json` 完整。
 
 ### 2.2 真实聊天评估请求（典型读路径）
 
@@ -139,18 +181,25 @@
 
 ## 3. 关键决策
 
-### 3.1 为什么 SQLite + Mem0 不上 Postgres？
+### 3.1 🔄 为什么 Postgres + pgvector（v1.1 决策 D1，取代原 SQLite + Mem0）
 
-**当前选择**：profile / event / relationship → SQLite；episodic → Mem0 (Qdrant 后端)
+**当前选择**：四层记忆 + 会话/消息/纠错 全在 **Postgres**；episodic 向量用 **pgvector**（同库 `vector` 列）。
 
 **理由**：
-- 单用户场景，SQLite 完全够用，无需运维成本
-- Mem0 是已成熟的"语义记忆"库，重写一遍不划算
-- 写入压力都集中在 Celery worker，没有 web 并发问题（**前提是只起一个 worker，并发 chat 同一用户用消息队列序列化**）
+- 本项目是**多账号、低并发、单机 docker compose**（PRD：邮箱注册、账号间记忆不共享，但存在多账号）。Postgres 在此前提下成本≈0——你已经要跑 Redis，再加一个 pg 容器就是几行 compose。
+- 一次性消除 4 个 legacy 坑：
+  - 坑 1.2（web/celery 共用 SQLAlchemy engine → `database is locked`）：Postgres 原生并发连接。
+  - 坑 9.2（SQLite on NFS 文件锁不稳）：Postgres 无文件锁问题。
+  - 坑 9.3（同用户 extract 抢锁需 redis_lock）：行级锁/MVCC，**可去掉 redis_lock**。
+  - 坑 10.3（测试内存 SQLite vs 生产 SQLite dialect 差异）：测试用 testcontainers 起同款 pg，dialect 一致。
+- pgvector 让四层记忆 + 向量**同库同事务**：episodic 软删/banned 过滤与关系数据在一个查询/事务里完成，省一个有状态服务、省一份备份。
+- "v2 易迁 Postgres"从口号变为现实（本就是 Postgres）。
 
-**反思**：v0.97 出现过的并发冲突来源于 web 同步写 + Celery 异步写共用同一 engine。新版要彻底分离：
-- API 进程：只写 conversation / message 这两张轻表
-- Worker 进程：只写四层记忆相关的表，且按 user_id 串行
+**为什么不再用 Mem0**：legacy 关掉 `infer`（坑 4.2）后 Mem0 ≈ "embed+存+召回"，自身智能全关却背依赖与版本漂移。事实抽取在 service 层做完，向量层只需存+近邻。详见 [08-Data-Model.md](./08-Data-Model.md) §3。
+
+**engine 分离仍保留**（但动机变了）：不再是绕 SQLite 锁，而是**连接池隔离 + 故障隔离**——
+- API 进程一个 engine（pool 大）；Celery worker 一个 engine（pool 小）。
+- 通过 `infra/db/factory.py` 按 `RUNTIME_KIND` 构造（见 [10-Lessons-Learned.md](./10-Lessons-Learned.md) §1.2）。
 
 ### 3.2 为什么 SSE 用 POST 不用 EventSource？
 
@@ -288,8 +337,8 @@ async def chat_stream(req: ChatRequest, orch: ChatOrchestrator = Depends()):
 | `services/eval_chat_review/store.py` | 落盘 / 读盘 / 列表 / 删除 | infra.fs | 临时目录集成测 |
 | `services/eval_synthetic/runner.py` | 跑合成 case | chat_orchestrator | mock llm |
 | `infra/llm/client.py` | OpenAI 兼容 client 抽象 | httpx | mock httpx |
-| `infra/vector/mem0_adapter.py` | Mem0 包装层 | mem0 | 集成测 |
-| `infra/db/models.py` | SQLAlchemy 模型 | sqlalchemy | 无 |
+| `infra/vector/pgvector_repo.py` | 🔄 v1.1：episodic add/search/soft_delete（pgvector） | sqlalchemy + pgvector | 集成测（testcontainers pg） |
+| `infra/db/models.py` | SQLAlchemy 模型（Postgres） | sqlalchemy | 无 |
 | `infra/db/repositories.py` | Repository 模式封装 | sqlalchemy | 集成测 |
 | `workers/extract.py` | extract_memory/profile/event 任务 | services | 集成测 |
 | `workers/correction.py` | correction_cleanup 任务 | services.correction | 集成测 |
@@ -374,10 +423,16 @@ correction_cleanup_task 流程见 [06-Subsystem-Correction.md](./06-Subsystem-Co
 | `INTENT_CLASSIFIER_ENABLED` | `true` | 关掉则只剩硬规则 |
 | `EVAL_CHAT_REVIEWS_DIR` | `/app/eval/exports/reviews` | 落盘根 |
 | `EVAL_PASS_THRESHOLD` | `0.85` | 合成评测通过线 |
-| `DEV_MODE` | `true` | seed_persona 等仅 dev 用 |
+| `DEV_MODE` | 🔄 `false` | **默认关**；dev 端点（seed_persona 等）另需启动期硬开关，见 §7 下方说明 |
 | `PROMPT_TIMEZONE` | `Asia/Shanghai` | 时间渲染 |
 | `JWT_SECRET` | dev 兜底 | 生产必须显式给 |
 | `APP_TITLE` | `MindEngine API` | OpenAPI 文档标题（legacy 为 MemoBot API，勿沿用） |
+| `DATABASE_URL` | 🔄 `postgresql+asyncpg://...` | Postgres 连接串（v1.1 取代 SQLite 路径） |
+| `RUNTIME_KIND` | `web` / `worker` | engine 池大小与隔离（见 §3.1） |
+| `EMBEDDING_MODEL` | `text-embedding-v3` | pgvector 写入/检索用，dim=1024 |
+| `INTENT_CACHE_ENABLED` | 🔄 `true` | intent 确定性可安全缓存（决策 D4） |
+
+> 🔄 **修订 v1.1 · dev 端点防误开（决策 D6）**：`DEV_MODE=true` 仅放开"只读"调试。涉及**重置/灌库**的端点（`seed_persona` / `debug/replay` 等会改数据）必须**额外**满足启动期硬开关（如独立 env `ALLOW_DESTRUCTIVE_DEV=1` 且仅当 `DATABASE_URL` 指向非生产库），并在路由注册时按 allowlist 挂载——避免单个 env 误配就能清空用户四层记忆。
 
 ---
 
@@ -398,20 +453,22 @@ correction_cleanup_task 流程见 [06-Subsystem-Correction.md](./06-Subsystem-Co
 │  └─────────────┘  └──────────────────┘ │
 │         │                                │
 │  ┌─────────────┐  ┌──────────────────┐ │
-│  │   redis     │  │   qdrant         │ │
-│  │  (queue)    │  │  (episodic mem)  │ │
+│  │   redis     │  │   postgres       │ │ 🔄 v1.1
+│  │  (queue)    │  │  (+ pgvector)    │ │
 │  └─────────────┘  └──────────────────┘ │
 │                                          │
 │  /app/eval/exports/ ← NFS shared        │
-│  /app/data/mindengine.db (sqlite)       │
+│  pgdata volume (Postgres 数据)          │ 🔄 v1.1
 └────────────────────────────────────────┘
 ```
 
 **说明**：
 - 全部容器化（docker compose），一台 ECS 即可跑
 - backend / celery / celery-beat 共用一份 image（同一份 `backend/` 代码）
-- redis 和 qdrant 用官方 image
-- 持久化目录：`/app/data` (SQLite) + qdrant_data volume
+- redis 用官方 image；Postgres 用 `pgvector/pgvector:pg16`（自带 pgvector 扩展）
+- 持久化：`pgdata` volume（含关系数据 + episodic 向量），不放 NFS（坑 9.2 不再适用，但 db volume 仍用本地块存储更稳）
+- 🔄 v1.1：相比 legacy 少一个 Qdrant 服务、少一份独立向量备份
+- 启动顺序：backend/celery `depends_on` postgres + redis 的 `service_healthy`（坑 9.1）
 
 ---
 
@@ -433,6 +490,9 @@ correction_cleanup_task 流程见 [06-Subsystem-Correction.md](./06-Subsystem-Co
 12. **Eval store**：路径穿越被挡（"../" 在 id 段里）
 13. **Eval review**：L0 warn 但 L1 全过 → final_status = ok（不是 suspicious）
 14. **Eval review**：personality_signature 仅 knowledge_task 跳过
+15. 🔄 **Chat 持久化（v1.1）**：LLM 产出 ≥1 token → 必有一条带 `meta_json` 的 message 落库；客户端断连不丢（§2.3）
+16. 🔄 **数据隔离（v1.1）**：任一 Repository 缺 user_id 即 raise；user B 检索四层 + episodic 向量 → 0 命中 user A 数据（[08-Data-Model.md](./08-Data-Model.md) §8）
+17. 🔄 **人格服从兜底（v1.1）**：reply 超人格契约字数上限 → 后置硬截断生效（[04-Subsystem-Personality.md](./04-Subsystem-Personality.md) §9.4）
 
 详见 [10-Lessons-Learned.md](./10-Lessons-Learned.md) 后半部分。
 

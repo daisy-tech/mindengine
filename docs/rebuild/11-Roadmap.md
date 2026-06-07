@@ -3,6 +3,8 @@
 > 责任：把 MindEngine 后端"从 0 重写到与 legacy MindMem v0.97 功能等价"切成 5 个里程碑，每个里程碑有明确"通过标准"。
 > 预估工期：单人 Opus 4.7 ≈ 3-4 周，含测试。
 
+> 🔄 **修订 v1.1（2026-06）**：M1 基础设施改为 Postgres + pgvector（去 Mem0/Qdrant，D1）；M2 新增"主聊模型选型实验 + 后置兜底 + 投机加载"（D3/D4）；M3 去掉 redis_lock 串行（Postgres 行级锁，D1）；M5 头像源文件需先补齐（D9）。
+
 ---
 
 ## 总览
@@ -29,7 +31,7 @@ M5  前端适配 + 上线对齐  → 2-3 天
 
 1. **创建仓库结构**
    - 按 [README.md](./README.md) §推荐项目结构 建目录
-   - `pyproject.toml` + 依赖（fastapi / sqlalchemy / pydantic / celery / openai / mem0 / pytest）
+   - `pyproject.toml` + 依赖（🔄 v1.1：fastapi / sqlalchemy / asyncpg / pgvector / alembic / pydantic / celery / openai / argon2-cffi / pytest；**去 mem0**）
    - Dockerfile + docker-compose.yml
    - pre-commit（ruff + mypy）
 
@@ -43,21 +45,24 @@ M5  前端适配 + 上线对齐  → 2-3 天
 3. **写所有 Protocol**
    - `services/protocols.py`：LLMClient / IntentClassifier / TaskDispatcher / 各 Repository
 
-4. **配置基础设施**
-   - SQLAlchemy 模型（按 [08-Data-Model.md](./08-Data-Model.md)）
+4. **配置基础设施**（🔄 v1.1）
+   - SQLAlchemy 模型（按 [08-Data-Model.md](./08-Data-Model.md)，Postgres）
+   - **pgvector 扩展**：migration 里 `CREATE EXTENSION IF NOT EXISTS vector` + `episodic_memories` 表 + HNSW 索引
    - Alembic 初始化 + 第一次 migration
    - Redis 连接
-   - Mem0 / Qdrant 连接
+   - `infra/db/factory.py`：按 `RUNTIME_KIND`（web/worker）构造 engine
+   - ~~Mem0 / Qdrant 连接~~（已移除）
 
 5. **写 LLMRouter 雏形**
    - `infra/llm/qwen_client.py`（含 enable_thinking 默认 false）
+   - 模型 id 走 §1 常量表（[09](./09-LLM-Strategy.md)），不写裸字符串
    - mock client for tests
 
-### 通过标准
+### 通过标准（🔄 v1.1）
 
-- `make test` → 至少 30 个 domain / repository / llm-mock 测试通过
-- `docker compose up` → 5 个服务起来（backend/redis/qdrant/celery/celery-beat），健康检查全过
-- `curl localhost:8000/healthz` → 200
+- `make test` → 至少 30 个 domain / repository / llm-mock 测试通过（含数据隔离测试）
+- `docker compose up` → **5 个服务**起来：backend / **postgres(+pgvector)** / redis / celery / celery-beat，健康检查全过（🔄 v1.1：以 postgres 取代原 qdrant，服务总数不变但少了独立向量库）
+- `curl localhost:8000/healthz` → 200，且能连通 Postgres + pgvector（一条 `SELECT '[1,2,3]'::vector` 验证扩展可用）
 
 ---
 
@@ -95,15 +100,31 @@ M5  前端适配 + 上线对齐  → 2-3 天
    - `api/chat.py`：POST /api/chat/stream
    - `api/auth.py`：登录注册（JWT）
 
-6. **测试**
+6. 🔄 **人格后置兜底 + 流式持久化解耦（v1.1）**
+   - `enforce_contract`（字数硬截断 + 内向削反问），结果记 `prompt_meta.contract_enforced`（[04](./04-Subsystem-Personality.md) §9.4）
+   - chat_orchestrator 用 `finally + asyncio.shield` 落库，断连不丢（[02-TDD.md](./02-TDD.md) §2.3，不变式 15）
+
+7. 🔄 **首字延迟优化（v1.1）**
+   - intent 缓存（`INTENT_CACHE_ENABLED`）
+   - 投机加载（intent 未命中硬规则时并发预拉记忆，[03](./03-Subsystem-Memory-Router.md) §8.3）
+
+8. 🔄 **主聊模型选型实验（v1.1 · 决策 D3）**
+   - 用 `personality_signature`（基于 enforce 前 reply）通过率，A/B 对比 `CHAT` 候选（qwen3.7-max vs Claude/GPT 系）
+   - 数据驱动定 `CHAT` 默认模型，不默认 qwen
+
+9. **测试**
    - 黄金样本：3 personality × 3 intent = 9 个 compose 测试
    - Memory Router 单测 ≥ 15 个
    - 端到端 mock LLM：发"你好" → 走完整流程 → reply 非空、meta 字段完整
+   - 🔄 断连测试：mock LLM 产 3 token 后 CancelledError → message 落库且 meta 完整
+   - 🔄 enforce 测试：内向超长 reply → enforce 后 ≤30 字、不以反问结尾
 
-### 通过标准
+### 通过标准（🔄 v1.1）
 
 - 手动 curl POST chat/stream，三种人格回复差异肉眼可见
 - selftest §1-5（Memory Router + Composer + 人格契约 + L0/L1 部分）全过 ≥ 50 个 case
+- 不变式 15（断连必落 meta）、17（超长必兜底）通过
+- 首字延迟 p95 ≤ 800ms（开投机加载/intent 缓存后实测）
 
 ---
 
@@ -120,11 +141,11 @@ Celery 任务真的把记忆写入四层。新用户聊 10 轮后 profile / even
    - asyncio.gather 并发拉 4 层
    - banned / deprecated 过滤打通
 
-2. **Celery 任务**
-   - `workers/extract_memory.py`（Mem0 入库）
+2. **Celery 任务**（🔄 v1.1）
+   - `workers/extract_memory.py`（LLM 抽事实 → embedding → pgvector 入库；write 端过 banned）
    - `workers/extract_profile.py`（LLM 抽取 + 合并）
    - `workers/extract_event.py`（LLM 抽取 + 入库）
-   - 同用户串行（Redis lock）
+   - ~~同用户串行（Redis lock）~~ → Postgres 行级锁/MVCC，**不再需要 redis_lock**（坑 9.3 失效）；如需限制同用户任务洪峰，用队列 routing 即可
 
 3. **Repository 完整实现**
    - profile / event / episodic / relationship 都实现
@@ -138,7 +159,7 @@ Celery 任务真的把记忆写入四层。新用户聊 10 轮后 profile / even
    - 端到端集成：注册新用户 → 跑 10 轮 → 验证 4 层都有数据
    - 关系图无 self-loop
    - banned 同时在 write 和 read 端生效
-   - Mem0 infer=False 验证
+   - 🔄 v1.1：事实抽取在 service 层、向量层只存不二次理解（取代 Mem0 infer=False 验证）；pgvector 召回 smoke
 
 ### 通过标准
 
@@ -170,9 +191,10 @@ Celery 任务真的把记忆写入四层。新用户聊 10 轮后 profile / even
 
 3. **Eval Chat Review**
    - `services/eval_chat_review/l0_rules.py`（8 条结构）
-   - `services/eval_chat_review/l1_rules.py`（11 条启发式，必须含修复后的 personality_signature 和 reply_off_topic）
+   - `services/eval_chat_review/l1_rules.py`（11 条启发式，必须含修复后的 personality_signature 和 reply_off_topic；fabrication 实体字典用结构化已知实体）
    - `services/eval_chat_review/attribution.py`
    - `services/eval_chat_review/reviewer.py`
+   - 🔄 `services/eval_chat_review/judge.py`（v1.1：对 L1 标红 turn 的可选小模型复核，默认关，[07](./07-Subsystem-Eval-Lab.md) §3.3a）
    - `services/eval_chat_review/store.py`（chmod 0644 + 路径穿越防御）
 
 4. **API**
@@ -204,7 +226,7 @@ Celery 任务真的把记忆写入四层。新用户聊 10 轮后 profile / even
    - 必要时前端做小幅调整（用户已许可 loose mode）
 
 2. **品牌适配（小白 / XiaoBai）**
-   - 从 `docs/rebuild/xiaobai-avatar.png` 复制到 `public/xiaobai-avatar.png`（见 [12-Brand-XiaoBai.md](./12-Brand-XiaoBai.md)）
+   - 头像源文件 `docs/rebuild/xiaobai-avatar.png` ✅ 已存在（40KB / WebP / 800×1448），直接复制到 `public/xiaobai-avatar.png`
    - 更新 `App.vue` / `ChatView.vue` / `ChatMessage.vue` / `LoginView.vue` 四处引用
    - 侧边栏标题改为「小白」，OpenAPI title 改为 MindEngine API
 
