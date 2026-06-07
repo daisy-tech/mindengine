@@ -72,7 +72,13 @@ services:
       DATABASE_URL: postgresql+asyncpg://mindengine:mindengine@postgres:5432/mindengine
       REDIS_URL: redis://redis:6379/0
       RUNTIME_KIND: worker
-    command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO"]
+    # NOTE: explicit -Q list so memory.* fan-out (routed to
+    # `mindengine.memory`) actually gets consumed by this worker.
+    command: [
+      "celery", "-A", "app.workers.celery_app:celery_app",
+      "worker", "--loglevel=INFO",
+      "-Q", "mindengine.default,mindengine.memory,mindengine.correction"
+    ]
 
   celery-beat:
     <<: *backend-base

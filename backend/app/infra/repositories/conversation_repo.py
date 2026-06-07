@@ -62,6 +62,19 @@ class ConversationRepo:
             return
         row.updated_at = when or datetime.now(UTC)
 
+    async def archive(self, conversation_id: str) -> bool:
+        """Soft-delete a conversation. Returns True iff a row was flipped.
+
+        The chat path filters ``archived=True`` rows out of ``list_recent``.
+        We never hard-delete: messages remain auditable.
+        """
+        row = await self.session.get(Conversation, conversation_id)
+        if row is None or row.user_id != self.user_id:
+            return False
+        row.archived = True
+        row.updated_at = datetime.now(UTC)
+        return True
+
 
 def _to_dto(row: Conversation) -> ConversationDTO:
     return ConversationDTO(

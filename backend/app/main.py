@@ -24,14 +24,16 @@ from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
+from app.api.memory import router as memory_router
 from app.config import Settings, get_settings
 from app.domain.llm import DEFAULT_MODELS, LLMRole
 from app.infra.auth import JwtCodec
 from app.infra.db.factory import make_engine, make_sessionmaker
 from app.infra.llm import LLMRouter, MockLLMClient
+from app.infra.llm.dashscope_embedder import DashScopeEmbedder
 from app.infra.llm.mock_client import MockEmbeddingClient
 from app.infra.llm.qwen_client import QwenClient
-from app.infra.tasks import InMemoryDispatcher
+from app.infra.tasks import CeleryDispatcher, InMemoryDispatcher
 from app.services.contract_guard import ContractGuard
 from app.services.memory_router import (
     InMemoryIntentCache,
@@ -70,11 +72,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Composer + guard + dispatcher + embedder (all stateless / process-wide)
     app.state.prompt_composer = PromptComposer(timezone=settings.prompt_timezone)
     app.state.contract_guard = ContractGuard()
-    app.state.task_dispatcher = InMemoryDispatcher()
-    # NOTE: a real DashScope embeddings client lands in M3 — until then,
-    # the deterministic Mock satisfies EpisodicRepo's constructor and is
-    # never called for non-episodic intents (CASUAL / KNOWLEDGE_TASK).
-    app.state.embedder = MockEmbeddingClient()
+    app.state.task_dispatcher = _build_dispatcher(settings)
+    app.state.embedder = _build_embedder(settings)
 
     # NOTE: ChatOrchestrator is constructed PER REQUEST in api.chat because
     # its MemoryContextLoader depends on per-user, per-session repos.
@@ -83,6 +82,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await engine.dispose()
+
+
+def _build_dispatcher(settings: Settings):
+    """Pick CeleryDispatcher in prod / in_memory for dev & tests.
+
+    The choice is driven by ``settings.task_dispatcher`` so unit tests
+    and the in-memory smoke flow can opt out without dragging Celery
+    bootstrapping into the API request path.
+    """
+    if settings.task_dispatcher == "celery":
+        # Lazy import: keeps the celery_app construction off any code
+        # path that doesn't actually dispatch (e.g. tests using
+        # InMemoryDispatcher).
+        from app.workers.celery_app import celery_app
+
+        return CeleryDispatcher(celery_app=celery_app)
+    return InMemoryDispatcher()
+
+
+def _build_embedder(settings: Settings):
+    """Pick a real DashScope embedder when an API key is configured.
+
+    Otherwise fall back to ``MockEmbeddingClient`` so unit tests, health
+    checks and chat flows that don't actually embed (CASUAL /
+    KNOWLEDGE_TASK) keep working out of the box.
+    """
+    if settings.openai_api_key and settings.openai_api_key != "replace-me":
+        client = AsyncOpenAI(
+            base_url=settings.openai_base_url,
+            api_key=settings.openai_api_key,
+        )
+        return DashScopeEmbedder(
+            client=client,
+            model=DEFAULT_MODELS[LLMRole.EMBEDDING],
+        )
+    return MockEmbeddingClient()
 
 
 def _build_llm_router(settings: Settings) -> LLMRouter:
@@ -121,6 +156,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(conversations_router)
     app.include_router(chat_router)
+    app.include_router(memory_router)
     return app
 
 

@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     dev_mode: bool = False
     allow_destructive_dev: bool = False
 
+    # ─── dispatcher
+    # 'celery' uses the Redis broker; 'in_memory' is a no-op recorder for
+    # local dev when no worker is running. Tests pin this explicitly.
+    task_dispatcher: Literal["celery", "in_memory"] = "celery"
+
     # ─── eval
     eval_chat_reviews_dir: str = "/app/eval/exports/reviews"
     eval_pass_threshold: float = 0.85

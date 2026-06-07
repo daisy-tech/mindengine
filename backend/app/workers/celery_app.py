@@ -24,7 +24,7 @@ def create_celery() -> Celery:
         "mindengine",
         broker=settings.redis_url,
         backend=settings.redis_url,
-        include=[],
+        include=["app.workers.tasks_after_chat"],
     )
     celery.conf.update(
         task_serializer="json",
@@ -37,7 +37,9 @@ def create_celery() -> Celery:
         task_default_queue="mindengine.default",
         task_routes={
             "correction.*": {"queue": "mindengine.correction"},
+            "memory.*": {"queue": "mindengine.memory"},
         },
+        broker_connection_retry_on_startup=True,
     )
     return celery
 

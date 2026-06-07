@@ -99,3 +99,99 @@ async def list_messages(
         )
         for r in rows
     ]
+
+
+@router.delete(
+    "/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_conversation(
+    conversation_id: str,
+    user_id: CurrentUserId,
+    session: SessionDep,
+) -> None:
+    """Soft-delete a conversation.
+
+    We deliberately keep the underlying messages — auditability beats
+    saved disk space. Listing endpoints filter by ``archived=False``.
+    """
+    repo = ConversationRepo(session=session, user_id=user_id)
+    archived = await repo.archive(conversation_id)
+    if not archived:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+    await session.commit()
+
+
+class AuditMessageDTO(BaseModel):
+    id: str
+    role: str
+    content: str
+    created_at: datetime
+    meta: dict | None = None
+    error: str | None = None
+
+
+class AuditExportDTO(BaseModel):
+    """Full export of a conversation for eval / debugging.
+
+    Includes archived rows (so a deleted conversation can still be
+    inspected) and the full ``meta_json`` for every assistant turn —
+    which is the basis for the eval harness in M5.
+    """
+
+    conversation_id: str
+    title: str | None
+    created_at: datetime
+    updated_at: datetime
+    archived: bool
+    messages: list[AuditMessageDTO]
+
+
+@router.get(
+    "/{conversation_id}/audit",
+    response_model=AuditExportDTO,
+)
+async def export_audit(
+    conversation_id: str,
+    user_id: CurrentUserId,
+    session: SessionDep,
+    limit: int = 500,
+) -> AuditExportDTO:
+    if limit <= 0 or limit > 5000:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="limit out of range",
+        )
+    # Direct table peek so archived conversations are exportable.
+    from app.infra.db.models import Conversation as ConvModel
+
+    row = await session.get(ConvModel, conversation_id)
+    if row is None or row.user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+
+    msg_repo = MessageRepo(session=session, user_id=user_id)
+    msgs = await msg_repo.list_history(conversation_id, limit=limit)
+    return AuditExportDTO(
+        conversation_id=row.id,
+        title=row.title,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        archived=row.archived,
+        messages=[
+            AuditMessageDTO(
+                id=m.id,
+                role=m.role,
+                content=m.content,
+                created_at=m.created_at,
+                meta=m.meta_json,
+                error=getattr(m, "error", None),
+            )
+            for m in msgs
+        ],
+    )

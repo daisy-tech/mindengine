@@ -107,6 +107,65 @@ def get_intent_cache(request: Request):
     return cache
 
 
+# ─────────────────────────────────────────────── memory repos bundle ──
+
+
+class MemoryRepos:
+    """Bundle of the four-layer + audit repos needed by ``api.memory``.
+
+    A single dependency keeps endpoint signatures tidy and makes the
+    integration tests trivially overridable (replace this provider once
+    instead of mocking out every Repo class).
+    """
+
+    def __init__(
+        self,
+        *,
+        profile,
+        event,
+        episodic,
+        relationship,
+        banned,
+        deprecation,
+    ) -> None:
+        self.profile = profile
+        self.event = event
+        self.episodic = episodic
+        self.relationship = relationship
+        self.banned = banned
+        self.deprecation = deprecation
+
+
+def get_memory_repos(
+    request: Request,
+    session: SessionDep,
+    user_id: CurrentUserId,  # forward ref ok — defined above
+) -> MemoryRepos:
+    from app.infra.repositories import (
+        BannedEntityRepo,
+        DeprecationRepo,
+        EpisodicRepo,
+        EventRepo,
+        ProfileRepo,
+        RelationshipRepo,
+    )
+
+    embedder = getattr(request.app.state, "embedder", None)
+    if embedder is None:
+        raise RuntimeError("App.state.embedder is unset; check lifespan setup")
+    return MemoryRepos(
+        profile=ProfileRepo(session=session, user_id=user_id),
+        event=EventRepo(session=session, user_id=user_id),
+        episodic=EpisodicRepo(session=session, user_id=user_id, embedder=embedder),
+        relationship=RelationshipRepo(session=session, user_id=user_id),
+        banned=BannedEntityRepo(session=session, user_id=user_id),
+        deprecation=DeprecationRepo(session=session, user_id=user_id),
+    )
+
+
+MemoryReposDep = Annotated[MemoryRepos, Depends(get_memory_repos)]
+
+
 def build_chat_orchestrator_factory(request: Request):
     """Returns a callable that builds a per-request ChatOrchestrator.
 
