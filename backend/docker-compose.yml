@@ -6,10 +6,18 @@
 name: mindengine
 
 x-backend-base: &backend-base
+  image: mindengine-backend:latest
   build:
     context: .
     dockerfile: Dockerfile
   env_file: .env
+  # Inside the compose network, DB/Redis are reached by service name — NOT
+  # localhost (which would point at the container itself). These override the
+  # localhost URLs in .env, which remain correct for host-native dev
+  # (uvicorn on Mac with ports 5432/6379 published).
+  environment:
+    DATABASE_URL: postgresql+asyncpg://mindengine:mindengine@postgres:5432/mindengine
+    REDIS_URL: redis://redis:6379/0
   depends_on:
     postgres:
       condition: service_healthy
@@ -46,6 +54,8 @@ services:
   backend:
     <<: *backend-base
     environment:
+      DATABASE_URL: postgresql+asyncpg://mindengine:mindengine@postgres:5432/mindengine
+      REDIS_URL: redis://redis:6379/0
       RUNTIME_KIND: web
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
@@ -59,12 +69,16 @@ services:
   celery:
     <<: *backend-base
     environment:
+      DATABASE_URL: postgresql+asyncpg://mindengine:mindengine@postgres:5432/mindengine
+      REDIS_URL: redis://redis:6379/0
       RUNTIME_KIND: worker
     command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO"]
 
   celery-beat:
     <<: *backend-base
     environment:
+      DATABASE_URL: postgresql+asyncpg://mindengine:mindengine@postgres:5432/mindengine
+      REDIS_URL: redis://redis:6379/0
       RUNTIME_KIND: worker
     command: ["celery", "-A", "app.workers.celery_app:celery_app", "beat", "--loglevel=INFO"]
 
