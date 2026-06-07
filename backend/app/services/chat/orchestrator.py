@@ -26,7 +26,7 @@ from typing import Literal
 
 from app.domain.llm import DEFAULT_MODELS, LLMRole
 from app.domain.prompt import PromptPack
-from app.domain.route import MemoryRoute, Personality
+from app.domain.route import Intent, MemoryRoute, Personality
 from app.infra.llm.exceptions import LLMError
 from app.services.chat.history import history_to_messages
 from app.services.contract_guard import ContractGuard
@@ -256,13 +256,24 @@ class ChatOrchestrator:
                 error=llm_error,
             )
             await repos.conversations.touch(conversation_id)
-            # M3 will fan out memory-extract tasks here.
-            await self.dispatcher.dispatch_after_chat(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                message_id=user_msg_id,
-                intent=route.intent.value,
-            )
+            # Per docs/rebuild/06-Subsystem-Correction.md §2: when the
+            # routed intent is correction, fire the correction_cleanup
+            # task INSTEAD of the after_chat fan-out. The two paths must
+            # be mutually exclusive — otherwise extract_* would race
+            # against the cleanup and re-write the just-deprecated facts.
+            if route.intent == Intent.CORRECTION:
+                await self.dispatcher.dispatch_correction_cleanup(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    message_id=user_msg_id,
+                )
+            else:
+                await self.dispatcher.dispatch_after_chat(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    message_id=user_msg_id,
+                    intent=route.intent.value,
+                )
         except Exception:
             # Never let persistence failures take down the connection.
             # In production, structlog will pick this up via uncaught logger.

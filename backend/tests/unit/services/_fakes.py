@@ -334,7 +334,7 @@ class FakeDispatcher:
         user_id: str,
         conversation_id: str,
         message_id: str,
-        targets: Sequence[CorrectionTarget],
+        targets: Sequence[CorrectionTarget] | None = None,
         judgements: Sequence[CorrectionJudgement] | None = None,
     ) -> None:
         self.correction.append(
@@ -342,7 +342,7 @@ class FakeDispatcher:
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "message_id": message_id,
-                "targets": [t.model_dump() for t in targets],
+                "targets": [t.model_dump() for t in (targets or [])],
                 "judgements": [j.model_dump() for j in (judgements or [])],
             }
         )

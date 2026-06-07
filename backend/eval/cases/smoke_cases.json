@@ -1,0 +1,110 @@
+[
+  {
+    "id": "smoke-001-casual-balanced",
+    "personality": "balanced",
+    "history": [],
+    "user": "你好，今天还好吗",
+    "expected": {
+      "intents": ["casual"],
+      "forbidden_phrases_in_reply": ["[出错", "AI 服务异常"]
+    },
+    "tags": ["casual", "first_turn"]
+  },
+  {
+    "id": "smoke-002-self-intro-followup",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我叫张三，老家湖南怀化"},
+      {"role": "assistant", "content": "记下来啦，张三老家在湖南怀化。"}
+    ],
+    "user": "你还记得我老家在哪儿吗",
+    "expected": {
+      "intents": ["memory_challenge"],
+      "must_activate_keywords": ["怀化"],
+      "forbidden_phrases_in_reply": ["[出错"]
+    },
+    "tags": ["memory_challenge", "post_intro"]
+  },
+  {
+    "id": "smoke-003-correction-hometown",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我老家湖南怀化"},
+      {"role": "assistant", "content": "怀化的米粉挺有名。"}
+    ],
+    "user": "不对，是怀宁，邻近安徽岳西",
+    "expected": {
+      "intents": ["correction"],
+      "must_contain": ["怀宁"],
+      "forbidden_phrases_in_reply": ["怀化", "已记录", "我会注意"]
+    },
+    "tags": ["correction", "geo"]
+  },
+  {
+    "id": "smoke-004-relationship-topic",
+    "personality": "extrovert",
+    "history": [
+      {"role": "user", "content": "我妻子叫李娜"},
+      {"role": "assistant", "content": "李娜，记下来啦。"}
+    ],
+    "user": "她最近工作有点累",
+    "expected": {
+      "intents": ["relationship_topic", "emotional_support"],
+      "optional_intents": ["emotional_support"],
+      "must_activate_keywords": ["李娜"],
+      "forbidden_phrases_in_reply": ["听起来", "我能感受到"]
+    },
+    "tags": ["relationship", "post_intro"]
+  },
+  {
+    "id": "smoke-005-emotional-support-introvert",
+    "personality": "introvert",
+    "history": [],
+    "user": "今天有点累",
+    "expected": {
+      "intents": ["emotional_support"],
+      "forbidden_phrases_in_reply": ["听起来", "我能感受到", "你可以告诉我"]
+    },
+    "tags": ["emotional_support", "introvert"]
+  },
+  {
+    "id": "smoke-006-knowledge-task",
+    "personality": "balanced",
+    "history": [],
+    "user": "Python 里 list 和 tuple 的区别是什么",
+    "expected": {
+      "intents": ["knowledge_task"],
+      "must_contain": ["可变", "list"]
+    },
+    "tags": ["knowledge_task"]
+  },
+  {
+    "id": "smoke-007-self-summary",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我叫张三，老家湖南怀化，做后端的"},
+      {"role": "assistant", "content": "记下来啦。"}
+    ],
+    "user": "总结一下我自己",
+    "expected": {
+      "intents": ["self_summary"],
+      "must_activate_keywords": ["张三", "怀化"]
+    },
+    "tags": ["self_summary"]
+  },
+  {
+    "id": "smoke-008-fabrication-guard",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我家有只猫"},
+      {"role": "assistant", "content": "好的，知道你家有猫。"}
+    ],
+    "user": "你忘了我们家养的什么了吗",
+    "expected": {
+      "intents": ["memory_challenge"],
+      "must_contain": ["猫"],
+      "forbidden_phrases_in_reply": ["小鹏", "狗", "我没注意到", "你可以告诉我"]
+    },
+    "tags": ["memory_challenge", "fabrication_check"]
+  }
+]

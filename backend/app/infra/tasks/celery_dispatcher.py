@@ -50,21 +50,26 @@ class CeleryDispatcher:
         user_id: str,
         conversation_id: str,
         message_id: str,
-        targets: Sequence[CorrectionTarget],
+        targets: Sequence[CorrectionTarget] | None = None,
         judgements: Sequence[CorrectionJudgement] | None = None,
     ) -> None:
-        # Stub for M3 — actual correction_cleanup task lands in M4.
-        # We still publish so the worker can ack and log.
+        """Publish ``correction.cleanup`` for one user-correction message.
+
+        Per docs/rebuild/06-Subsystem-Correction.md §2: the worker
+        re-derives the correction targets from the persisted message,
+        so we don't need to ship them through the broker. The
+        ``targets`` / ``judgements`` parameters are kept on the
+        protocol for forward-compat (debug / replay flows).
+        """
+
+        _ = targets  # accepted but not forwarded (worker reads from DB)
+        _ = judgements
         await self._send(
             "correction.cleanup",
             kwargs={
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "message_id": message_id,
-                "targets": [t.model_dump(mode="json") for t in targets],
-                "judgements": [
-                    j.model_dump(mode="json") for j in (judgements or [])
-                ],
             },
         )
 

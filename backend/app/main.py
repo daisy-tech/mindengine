@@ -23,6 +23,7 @@ from openai import AsyncOpenAI
 from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
 from app.api.conversations import router as conversations_router
+from app.api.eval import router as eval_router
 from app.api.health import router as health_router
 from app.api.memory import router as memory_router
 from app.config import Settings, get_settings
@@ -157,6 +158,7 @@ def create_app() -> FastAPI:
     app.include_router(conversations_router)
     app.include_router(chat_router)
     app.include_router(memory_router)
+    app.include_router(eval_router)
     return app
 
 

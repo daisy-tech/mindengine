@@ -21,6 +21,11 @@ FROM deps AS runtime
 COPY app /app/app
 COPY alembic /app/alembic
 COPY alembic.ini /app/alembic.ini
+# Synthetic eval cases live next to the backend (not under app/) so they
+# are easy to swap in CI without touching the Python package. Ship the
+# default smoke set inside the image so /api/eval/synthetic works
+# out-of-the-box.
+COPY eval /app/eval
 ENV PYTHONPATH=/app
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

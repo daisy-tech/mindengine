@@ -24,7 +24,10 @@ def create_celery() -> Celery:
         "mindengine",
         broker=settings.redis_url,
         backend=settings.redis_url,
-        include=["app.workers.tasks_after_chat"],
+        include=[
+            "app.workers.tasks_after_chat",
+            "app.workers.tasks_correction",
+        ],
     )
     celery.conf.update(
         task_serializer="json",

@@ -14,10 +14,12 @@ from app.workers.tasks_after_chat import (
     extract_profile,
     extract_relationship,
 )
+from app.workers.tasks_correction import correction_cleanup
 
 __all__ = [
     "after_chat",
     "celery_app",
+    "correction_cleanup",
     "extract_episodic",
     "extract_event",
     "extract_profile",

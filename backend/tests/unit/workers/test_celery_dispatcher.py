@@ -45,7 +45,12 @@ async def test_dispatch_after_chat_publishes_correct_task():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_correction_serializes_targets():
+async def test_dispatch_correction_publishes_correct_task():
+    """The worker re-derives targets from message history, so the
+    dispatcher only forwards the (user, conversation, message) triple.
+    ``targets`` / ``judgements`` remain in the protocol for forward
+    compatibility but must NOT be put on the wire.
+    """
     celery = _FakeCelery()
     disp = CeleryDispatcher(celery_app=celery)
     await disp.dispatch_correction_cleanup(
@@ -54,10 +59,14 @@ async def test_dispatch_correction_serializes_targets():
         message_id="m1",
         targets=[CorrectionTarget(ref="岳西", verb="不是", correct="怀宁")],
     )
+    assert len(celery.sent) == 1
     name, kwargs = celery.sent[0]
     assert name == "correction.cleanup"
-    assert kwargs["targets"][0]["ref"] == "岳西"
-    assert kwargs["targets"][0]["correct"] == "怀宁"
+    assert kwargs == {
+        "user_id": "u1",
+        "conversation_id": "c1",
+        "message_id": "m1",
+    }
 
 
 @pytest.mark.asyncio

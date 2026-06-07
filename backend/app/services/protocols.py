@@ -282,6 +282,6 @@ class TaskDispatcher(Protocol):
         user_id: str,
         conversation_id: str,
         message_id: str,
-        targets: Sequence[CorrectionTarget],
+        targets: Sequence[CorrectionTarget] | None = None,
         judgements: Sequence[CorrectionJudgement] | None = None,
     ) -> None: ...

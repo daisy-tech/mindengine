@@ -58,8 +58,15 @@ class Settings(BaseSettings):
 
     # ─── eval
     eval_chat_reviews_dir: str = "/app/eval/exports/reviews"
+    eval_synthetic_cases_dir: str = "/app/eval/cases"
     eval_pass_threshold: float = 0.85
     judge_enabled: bool = False
+    eval_user_id: str = "eval-bot-zhangsan"
+
+    # ─── correction
+    correction_confidence_threshold: float = 0.7
+    correction_candidate_limit: int = 10
+    banned_max_len: int = 8
 
 
 @lru_cache(maxsize=1)

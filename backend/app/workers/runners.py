@@ -18,6 +18,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.domain.memory import Event, Relationship
+from app.services.correction.applier import ApplyOutcome, CorrectionApplier
+from app.services.correction.banned_extractor import BannedExtractor
+from app.services.correction.extractor import CorrectionTargetExtractor
+from app.services.correction.judge import CorrectionJudge, JudgementOutcome
+from app.services.correction.searcher import CorrectionCandidateSearcher
 from app.services.memory_extract.episodic_extractor import EpisodicExtractor
 from app.services.memory_extract.event_extractor import EventExtractor
 from app.services.memory_extract.profile_extractor import ProfileExtractor
@@ -289,3 +294,118 @@ async def run_extract_relationship(
         upserted.append(rel.id)
 
     return {"status": "ok", "upserted": len(upserted), "ids": upserted}
+
+
+# ─────────────────────────────────────────────────────────────────
+# Correction cleanup
+# ─────────────────────────────────────────────────────────────────
+
+
+async def _load_correction_pair(
+    *,
+    message_repo: MessageRepository,
+    conversation_id: str,
+    message_id: str,
+) -> tuple[Any, Any | None] | None:
+    """Locate the user's correction message + the AI message immediately
+    preceding it.
+
+    Returns ``(user_msg, ai_msg | None)`` or ``None`` if the user message
+    is missing (worker should silently skip).
+    """
+    history = await message_repo.list_history(conversation_id, limit=12)
+    # ``list_history`` is chronological (oldest → newest). Find the user
+    # correction message and the most-recent assistant turn before it.
+    user_msg = None
+    ai_msg = None
+    for m in history:
+        if m.id == message_id and m.role == "user":
+            user_msg = m
+            break
+        if m.role == "assistant":
+            ai_msg = m
+    if user_msg is None:
+        return None
+    return user_msg, ai_msg
+
+
+async def run_correction_cleanup(
+    *,
+    target_extractor: CorrectionTargetExtractor,
+    searcher: CorrectionCandidateSearcher,
+    judge: CorrectionJudge,
+    banned_extractor: BannedExtractor,
+    applier: CorrectionApplier,
+    message_repo: MessageRepository,
+    user_id: str,
+    conversation_id: str,
+    message_id: str,
+) -> dict[str, Any]:
+    """End-to-end correction cleanup for one user-correction message.
+
+    Returns a small dict suitable for Celery result backends + tests.
+    """
+    pair = await _load_correction_pair(
+        message_repo=message_repo,
+        conversation_id=conversation_id,
+        message_id=message_id,
+    )
+    if pair is None:
+        return {"status": "skipped", "reason": "message_not_found"}
+    user_msg, ai_msg = pair
+
+    targets = await target_extractor.extract(
+        user_correction=user_msg.content,
+        ai_previous_reply=(ai_msg.content if ai_msg else ""),
+    )
+    if not targets:
+        return {"status": "ok", "targets": 0, "applied": 0}
+
+    bundle = await searcher.search(targets)
+    outcomes: list[JudgementOutcome] = []
+    for cand in bundle.items:
+        outcomes.append(
+            await judge.judge(
+                user_correction=user_msg.content,
+                ai_previous_reply=(ai_msg.content if ai_msg else ""),
+                candidate=cand,
+            )
+        )
+
+    banned = await banned_extractor.extract(
+        user_correction=user_msg.content,
+        targets=targets,
+    )
+
+    apply_out: ApplyOutcome = await applier.apply(
+        outcomes=outcomes,
+        banned=banned,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        correction_message_id=message_id,
+        user_correction_text=user_msg.content,
+    )
+
+    return {
+        "status": "ok",
+        "targets": len(targets),
+        "candidates": len(bundle.items),
+        "applied": apply_out.episodic_soft_deleted
+        + apply_out.event_soft_deleted
+        + apply_out.profile_fields_patched,
+        "audit_only": apply_out.audit_only,
+        "banned_inserted": apply_out.banned_inserted,
+        "deprecations_inserted": apply_out.deprecations_inserted,
+        "notes": apply_out.notes,
+    }
+
+
+__all__ = [
+    "ApplyOutcome",
+    "load_turn_context",
+    "run_correction_cleanup",
+    "run_extract_episodic",
+    "run_extract_event",
+    "run_extract_profile",
+    "run_extract_relationship",
+]
