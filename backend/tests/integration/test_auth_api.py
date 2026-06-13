@@ -77,6 +77,88 @@ def test_register_short_password_rejected(client) -> None:
     assert r.status_code in (400, 422)
 
 
+def test_change_password_happy_path(client) -> None:
+    # Register and grab token.
+    r = client.post(
+        "/auth/register",
+        json={"email": "rotate-api@example.com", "password": "hunter22-strong"},
+    )
+    assert r.status_code == 201
+    token = r.json()["access_token"]
+
+    # Rotate the password.
+    r2 = client.post(
+        "/auth/change-password",
+        headers=auth_header(token),
+        json={
+            "current_password": "hunter22-strong",
+            "new_password": "brand-new-pass-9",
+        },
+    )
+    assert r2.status_code == 204, r2.text
+
+    # Old password is dead.
+    r3 = client.post(
+        "/auth/login",
+        json={"email": "rotate-api@example.com", "password": "hunter22-strong"},
+    )
+    assert r3.status_code == 401
+
+    # New password works.
+    r4 = client.post(
+        "/auth/login",
+        json={"email": "rotate-api@example.com", "password": "brand-new-pass-9"},
+    )
+    assert r4.status_code == 200
+
+
+def test_change_password_wrong_current_returns_401(client) -> None:
+    r = client.post(
+        "/auth/register",
+        json={"email": "rotate-bad@example.com", "password": "hunter22-strong"},
+    )
+    token = r.json()["access_token"]
+    r2 = client.post(
+        "/auth/change-password",
+        headers=auth_header(token),
+        json={
+            "current_password": "WRONG",
+            "new_password": "brand-new-pass-9",
+        },
+    )
+    assert r2.status_code == 401
+    assert "incorrect" in r2.json()["detail"].lower()
+
+
+def test_change_password_without_token_returns_401(client) -> None:
+    r = client.post(
+        "/auth/change-password",
+        json={
+            "current_password": "anything",
+            "new_password": "brand-new-pass-9",
+        },
+    )
+    assert r.status_code == 401
+
+
+def test_change_password_weak_new_rejected(client) -> None:
+    r = client.post(
+        "/auth/register",
+        json={"email": "rotate-weak@example.com", "password": "hunter22-strong"},
+    )
+    token = r.json()["access_token"]
+    r2 = client.post(
+        "/auth/change-password",
+        headers=auth_header(token),
+        json={
+            "current_password": "hunter22-strong",
+            "new_password": "short",
+        },
+    )
+    # Pydantic min_length kicks in at 422 first.
+    assert r2.status_code in (400, 422)
+
+
 def test_register_invalid_email_rejected(client) -> None:
     r = client.post(
         "/auth/register",

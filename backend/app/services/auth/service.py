@@ -119,6 +119,56 @@ class AuthService:
     async def get_user(self, user_id: str) -> UserRecord | None:
         return await self.users.get_by_id(user_id)
 
+    async def change_password(
+        self,
+        *,
+        user_id: str,
+        current_password: str,
+        new_password: str,
+    ) -> None:
+        """Self-service password rotation for an authenticated user.
+
+        Requires the *current* password (so a stolen JWT alone cannot
+        rotate the password). The new password is checked against the
+        same minimum-strength policy as registration.
+        """
+
+        user = await self.users.get_by_id(user_id)
+        if user is None or not user.is_active:
+            raise InvalidCredentialsError("user not found")
+        if not self.hasher.verify(user.password_hash, current_password):
+            raise InvalidCredentialsError("current password is incorrect")
+        self._check_password_strength(new_password)
+        await self.users.update_password_hash(
+            user_id, self.hasher.hash(new_password)
+        )
+
+    async def admin_reset_password(
+        self,
+        *,
+        email: str,
+        new_password: str,
+    ) -> str:
+        """Out-of-band password reset (admin/CLI).
+
+        Used by ``scripts/reset_password.py`` when a user is locked out.
+        Trust model: caller already has shell access to the host (or the
+        backend container), so authentication is the shell itself — we
+        deliberately do NOT expose this on the HTTP surface.
+
+        Returns the user_id of the affected user.
+        """
+
+        email_norm = self._normalize_email(email)
+        user = await self.users.get_by_email(email_norm)
+        if user is None:
+            raise InvalidCredentialsError(f"no user with email {email_norm!r}")
+        self._check_password_strength(new_password)
+        await self.users.update_password_hash(
+            user.id, self.hasher.hash(new_password)
+        )
+        return user.id
+
     # ─── helpers ───────────────────────────────────────────────────
 
     def _issue(self, user_id: str) -> AuthResult:

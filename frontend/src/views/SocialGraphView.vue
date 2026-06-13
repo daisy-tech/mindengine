@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
-import { ElMessage } from 'element-plus';
 import { listRelationships, type Relationship } from '@/api/memory';
 import { useAuthStore } from '@/stores/auth';
 

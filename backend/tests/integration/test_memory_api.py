@@ -226,10 +226,38 @@ def test_post_banned_rejects_only_blank(
         json={"entities": ["", "   "]},
         headers=dev_headers("u1"),
     )
-    # Pydantic will reject min_length on entities itself? Let's check —
-    # entities has min_length=1 (at least one element); blank strings get
-    # filtered server-side. That hits our 400.
-    assert r.status_code == 400
+    # DTO's BannedEntityStr has min_length=1 + strip_whitespace=True, so
+    # blank strings get rejected at the request validation layer (422).
+    assert r.status_code == 422
+
+
+def test_post_banned_rejects_too_long(
+    dev_client: TestClient, dev_harness: SimpleHarness
+) -> None:
+    """Domain rule (doc 06 §6.4 / lesson 5.2): entity ≤ 8 chars.
+
+    Used to bubble up as a 500 because the API blindly fed the string into
+    the domain validator. We now mirror the rule on the request DTO so the
+    client gets a clean 422 with a helpful field path.
+    """
+    r = dev_client.post(
+        "/api/memory/banned-entities",
+        json={"entities": ["一二三四五六七八九"], "reason": "stale"},  # 9 chars
+        headers=dev_headers("u1"),
+    )
+    assert r.status_code == 422
+
+
+def test_post_banned_accepts_exactly_eight(
+    dev_client: TestClient, dev_harness: SimpleHarness
+) -> None:
+    r = dev_client.post(
+        "/api/memory/banned-entities",
+        json={"entities": ["一二三四五六七八"], "reason": "edge"},  # 8 chars
+        headers=dev_headers("u1"),
+    )
+    assert r.status_code == 201
+    assert r.json()["inserted"] == 1
 
 
 # ─────────────────────────────────────────────────────────────────

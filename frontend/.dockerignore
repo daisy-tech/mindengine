@@ -1,5 +1,8 @@
 node_modules
 dist
 .DS_Store
+**/.DS_Store
+# macOS AppleDouble metadata — breaks Docker build on NFS (xattr: operation not permitted)
+**/._*
 ._*
 *.log

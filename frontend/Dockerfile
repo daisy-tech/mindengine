@@ -32,11 +32,15 @@ RUN if [ -f package-lock.json ]; then \
 # ─── build stage ──────────────────────────────────────────────────
 FROM node:${NODE_VERSION}-alpine AS build
 WORKDIR /app
+# Small ECS instances (1–2 GB RAM) OOM or swap-thrash on vue-tsc + sourcemaps.
+# Typecheck stays in local/CI `npm run build`; image build only runs vite.
+ENV DOCKER_BUILD=1 \
+    NODE_OPTIONS="--max-old-space-size=768"
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json tsconfig.json vite.config.ts index.html ./
 COPY src ./src
 COPY public ./public
-RUN npm run build
+RUN npm run build:docker
 
 # ─── runtime stage ────────────────────────────────────────────────
 FROM nginx:1.27-alpine AS runtime

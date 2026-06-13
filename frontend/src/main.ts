@@ -1,8 +1,9 @@
 import { createApp } from 'vue';
 import { createPinia } from 'pinia';
-import ElementPlus from 'element-plus';
-import 'element-plus/dist/index.css';
-import zhCn from 'element-plus/es/locale/lang/zh-cn';
+// Element Plus components/APIs are auto-imported on demand (see vite.config.ts).
+// Only the reset stylesheet is needed globally; per-component CSS is injected
+// by the resolver. zh-cn locale is applied via <el-config-provider> in App.vue.
+import 'element-plus/theme-chalk/base.css';
 
 import App from './App.vue';
 import { router } from './router';
@@ -12,7 +13,6 @@ import './styles.css';
 const app = createApp(App);
 app.use(createPinia());
 app.use(router);
-app.use(ElementPlus, { locale: zhCn });
 
 // Best-effort token refresh before the first route guard fires.
 const auth = useAuthStore();

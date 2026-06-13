@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import { useRouter, RouterView } from 'vue-router';
+import zhCn from 'element-plus/es/locale/lang/zh-cn';
 import { useAuthStore } from '@/stores/auth';
+import ChangePasswordDialog from '@/components/ChangePasswordDialog.vue';
 
 const auth = useAuthStore();
 const router = useRouter();
 
 const showShell = computed(() => auth.isAuthed);
+const showChangePwd = ref(false);
 
 async function logout() {
   auth.clear();
@@ -15,6 +18,7 @@ async function logout() {
 </script>
 
 <template>
+  <el-config-provider :locale="zhCn">
   <div v-if="showShell" class="app-shell">
     <aside class="sidebar">
       <div class="sidebar-brand">
@@ -33,12 +37,15 @@ async function logout() {
       <div class="sidebar-footer">
         <div>{{ auth.displayName || auth.email || auth.userId }}</div>
         <div>人格 · {{ auth.personality }}</div>
-        <div class="logout" @click="logout">退出登录</div>
+        <div class="footer-link" @click="showChangePwd = true">修改密码</div>
+        <div class="footer-link" @click="logout">退出登录</div>
       </div>
     </aside>
     <main class="main">
       <RouterView />
     </main>
+    <ChangePasswordDialog v-model="showChangePwd" />
   </div>
   <RouterView v-else />
+  </el-config-provider>
 </template>

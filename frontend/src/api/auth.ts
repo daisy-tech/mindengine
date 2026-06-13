@@ -36,3 +36,10 @@ export async function fetchMe(): Promise<MeResponse> {
   const { data } = await http.get<MeResponse>('/auth/me');
   return data;
 }
+
+export async function changePassword(payload: {
+  current_password: string;
+  new_password: string;
+}): Promise<void> {
+  await http.post('/auth/change-password', payload);
+}

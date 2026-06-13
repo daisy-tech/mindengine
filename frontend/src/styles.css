@@ -104,10 +104,20 @@ a {
   padding-top: 12px;
 }
 
-.sidebar-footer .logout {
+.sidebar-footer .footer-link {
   margin-top: 6px;
   cursor: pointer;
+  color: rgba(255, 255, 255, 0.78);
+  transition: color 0.15s ease;
+}
+.sidebar-footer .footer-link:hover {
+  color: #fff;
+}
+.sidebar-footer .footer-link:last-child {
   color: #fca5a5;
+}
+.sidebar-footer .footer-link:last-child:hover {
+  color: #fecaca;
 }
 
 .main {

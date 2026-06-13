@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue';
-import { ElMessage, ElMessageBox } from 'element-plus';
 import { useChatStore, type ChatTurn } from '@/stores/chat';
 import { useAuthStore } from '@/stores/auth';
 import ChatMessage from '@/components/ChatMessage.vue';

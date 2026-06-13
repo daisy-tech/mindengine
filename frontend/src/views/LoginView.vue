@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { reactive, ref } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
-import { ElMessage } from 'element-plus';
 import { formatApiError } from '@/api/errors';
 import { useAuthStore } from '@/stores/auth';
 
@@ -11,6 +10,7 @@ const route = useRoute();
 
 const mode = ref<'login' | 'register'>('login');
 const loading = ref(false);
+const showHelp = ref(false);
 
 const form = reactive({
   email: '',
@@ -95,8 +95,40 @@ async function submit() {
         <a href="#" @click.prevent="mode = mode === 'login' ? 'register' : 'login'">
           {{ mode === 'login' ? '没有账号？立即注册' : '已有账号？返回登录' }}
         </a>
+        <span v-if="mode === 'login'" class="dot">·</span>
+        <a v-if="mode === 'login'" href="#" @click.prevent="showHelp = true">
+          忘记密码？
+        </a>
       </div>
     </div>
+
+    <el-dialog
+      v-model="showHelp"
+      title="忘记密码 / 重置"
+      width="480px"
+      align-center
+    >
+      <p>
+        本 PoC 阶段未接入邮件服务，所以暂不支持纯客户端的「邮件重置」流程。请按以下任意一种方式重置：
+      </p>
+      <ol class="help-list">
+        <li>
+          <strong>登录后修改：</strong>登录后可在左下角「修改密码」中自助修改。
+        </li>
+        <li>
+          <strong>已锁出（找管理员）：</strong>请管理员在服务器上执行：
+          <pre class="help-code">docker compose exec backend python scripts/reset_password.py \
+  --email 你的邮箱 --password 新密码</pre>
+          脚本会用与注册一致的密码策略（≥ 8 位）和 Argon2 哈希更新数据库。
+        </li>
+      </ol>
+      <p class="help-note">
+        若未来接入 SMTP，可在此处补上「发送重置链接」按钮。
+      </p>
+      <template #footer>
+        <el-button type="primary" @click="showHelp = false">知道了</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -135,5 +167,28 @@ async function submit() {
 .switch {
   margin-top: 14px;
   font-size: 13px;
+}
+.switch .dot {
+  margin: 0 8px;
+  color: var(--xb-muted);
+}
+.help-list {
+  padding-left: 20px;
+  line-height: 1.8;
+}
+.help-code {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 6px 0 4px;
+}
+.help-note {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--xb-muted);
 }
 </style>

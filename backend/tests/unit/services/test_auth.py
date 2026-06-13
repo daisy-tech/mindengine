@@ -97,3 +97,84 @@ async def test_personality_default_balanced(service) -> None:
     user = await service.get_user(res.user_id)
     assert user is not None
     assert user.personality == Personality.BALANCED
+
+
+@pytest.mark.asyncio
+async def test_change_password_success(service) -> None:
+    res = await service.register(
+        email="rotate@example.com", password="hunter22-strong"
+    )
+    await service.change_password(
+        user_id=res.user_id,
+        current_password="hunter22-strong",
+        new_password="brand-new-pass-9",
+    )
+    # Old password no longer works.
+    with pytest.raises(InvalidCredentialsError):
+        await service.login(email="rotate@example.com", password="hunter22-strong")
+    # New password does.
+    relogin = await service.login(
+        email="rotate@example.com", password="brand-new-pass-9"
+    )
+    assert relogin.user_id == res.user_id
+
+
+@pytest.mark.asyncio
+async def test_change_password_wrong_current(service) -> None:
+    res = await service.register(
+        email="rotate2@example.com", password="hunter22-strong"
+    )
+    with pytest.raises(InvalidCredentialsError):
+        await service.change_password(
+            user_id=res.user_id,
+            current_password="WRONG",
+            new_password="brand-new-pass-9",
+        )
+
+
+@pytest.mark.asyncio
+async def test_change_password_weak_new(service) -> None:
+    res = await service.register(
+        email="rotate3@example.com", password="hunter22-strong"
+    )
+    with pytest.raises(WeakPasswordError):
+        await service.change_password(
+            user_id=res.user_id,
+            current_password="hunter22-strong",
+            new_password="123",
+        )
+
+
+@pytest.mark.asyncio
+async def test_admin_reset_password_success(service) -> None:
+    res = await service.register(
+        email="locked@example.com", password="hunter22-strong"
+    )
+    affected = await service.admin_reset_password(
+        email="LOCKED@example.com",
+        new_password="brand-new-pass-9",
+    )
+    assert affected == res.user_id
+    relogin = await service.login(
+        email="locked@example.com", password="brand-new-pass-9"
+    )
+    assert relogin.user_id == res.user_id
+
+
+@pytest.mark.asyncio
+async def test_admin_reset_password_unknown_user(service) -> None:
+    with pytest.raises(InvalidCredentialsError):
+        await service.admin_reset_password(
+            email="ghost@example.com",
+            new_password="brand-new-pass-9",
+        )
+
+
+@pytest.mark.asyncio
+async def test_admin_reset_password_weak(service) -> None:
+    await service.register(email="locked2@example.com", password="hunter22-strong")
+    with pytest.raises(WeakPasswordError):
+        await service.admin_reset_password(
+            email="locked2@example.com",
+            new_password="123",
+        )

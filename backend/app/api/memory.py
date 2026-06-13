@@ -11,10 +11,10 @@ the user — the chat path itself never reads through this API.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, ValidationError
 
 from app.api.deps import CurrentUserId, MemoryReposDep, SessionDep
 from app.domain.correction import BannedEntity, MemoryDeprecation
@@ -39,8 +39,17 @@ class BannedEntityDTO(BaseModel):
     created_at: datetime
 
 
+# Mirror of domain.BannedEntity.entity rules (doc 06 §6.4 / lesson 5.2):
+# strip whitespace, length 1..8 after strip. Enforce at the request boundary
+# so we get a uniform 422 instead of a 500 from the domain validator.
+BannedEntityStr = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=8),
+]
+
+
 class AddBannedRequest(BaseModel):
-    entities: list[str] = Field(min_length=1, max_length=50)
+    entities: list[BannedEntityStr] = Field(min_length=1, max_length=50)
     reason: str = Field(default="", max_length=500)
 
 
@@ -243,12 +252,21 @@ async def add_banned(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="entities must contain at least one non-empty string",
         )
-    inserted = await repos.banned.add_many(
-        [
+    try:
+        domain_objs = [
             BannedEntity(user_id=user_id, entity=e, reason=body.reason)
             for e in cleaned
         ]
-    )
+    except ValidationError as exc:
+        # The DTO already mirrors domain rules, so we should rarely get here.
+        # Kept as a safety net so future tightening of the domain validator
+        # surfaces as a 400 instead of a 500.
+        first = exc.errors()[0] if exc.errors() else {"msg": str(exc)}
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid banned entity: {first.get('msg', exc)}",
+        ) from exc
+    inserted = await repos.banned.add_many(domain_objs)
     await session.commit()
     return {"inserted": inserted}
 
