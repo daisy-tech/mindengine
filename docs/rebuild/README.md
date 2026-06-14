@@ -1,158 +1,234 @@
-# MindEngine 后端重构依赖包
+# MindEngine
 
-> 本目录是 **MindEngine** 项目"**后端从 0 到 1 重构**"所需的全部设计依据。
-> 当前 monorepo 内 `backend/` 目录是 legacy **MindMem** v0.97 的参考实现，**架构思路正确，但实现细节遗漏多、补丁层层**，
-> 因此从 0 重写一个干净版（用 Claude Opus 4.7），目标：
-> - 同等功能完整性（v1.2.3）
-> - 更干净的模块边界、更稳的数据一致性、更可测的代码
-> - 允许重设 API（前端 `frontend/` 不动，后续小改适配）
+带长期记忆的 AI 聊天后端 + Web 前端。AI 伙伴叫 **小白（XiaoBai）**。
 
----
+当前版本：**v2.0.0**（含 v2.0.1–v2.0.2.8 补丁，详见 [CHANGELOG/v2.0.0.md](CHANGELOG/v2.0.0.md)）。
 
-## 🔄 修订记录
-
-### rebuild v1.1（2026-06）· 架构评审后的关键决策
-
-> 本次修订基于一轮完整设计评审，落地以下结构性决策。各子文档已同步更新，并在对应位置标注 `🔄 修订 v1.1`。
-
-| # | 决策 | 影响文档 | 动机 |
-|---|---|---|---|
-| D1 | **存储统一为 Postgres + pgvector**，砍掉 SQLite / Mem0 / Qdrant；infra 简化为 **Postgres + Redis** | 02 / 05 / 08 / 09 / 11 | 单机 docker compose 下 Postgres 成本≈0，却一次性消灭坑 1.2 / 9.2 / 9.3 / 10.3，兑现"易迁"承诺，pgvector 让四层记忆+向量同库同事务，infra 净减一个服务 |
-| D2 | **流式持久化与客户端连接解耦**：只要 LLM 产出 ≥1 token，必落一条带 `prompt_meta` 的 message（哪怕客户端断连） | 02 §2.1 / §9 | 修复"断连即丢审计"漏洞，保住评测体系基石 |
-| D3 | **人格服从率改为"规则后置兜底 + 选型实验"保障**，验收口径改统计带 | 04 / 01 / 11 | 模型服从率仅 ~70%，不能把核心卖点押在 LLM 自觉上 |
-| D4 | **首字延迟拆显式预算 + 投机加载 + intent 可缓存** | 03 | 800ms 预算偏紧，intent 在关键路径串行 |
-| D5 | **L1 标红 turn 提前引入便宜小模型 judge**（幻觉/复述判断不靠脆弱正则） | 07 | 幻觉检测是核心承诺，纯规则不可靠 |
-| D6 | **补安全基线**：口令哈希算法、`DEV_MODE` 默认 false + 硬开关、数据隔离测试 | 08 / 09 | dev 端点能重置用户记忆，误配风险高 |
-| D7 | **数据迁移：✅ 策略 A 全弃**（从 0 开始，不迁 legacy 真实数据） | 08 §10 | 已定；真实聊天评估靠合成 case + 新攒会话补足 |
-| D8 | **模型 id 统一为常量表**、仓库结构澄清、`intent` 历史窗口口径统一、`≤7000 行` 降级为参考目标 | 09 / README / 03 | 消除命名漂移（坑 2.4 本身）与文档内自相矛盾 |
-| D9 | ✅ **头像资产已确认存在**：`docs/rebuild/xiaobai-avatar.png`（40KB/WebP/800×1448）| 12 | 初稿误报缺失，实际无需补齐 |
+技术栈：FastAPI · Vue 3 · Postgres + pgvector · Redis · Celery · 阿里云 DashScope（Qwen，OpenAI 兼容接口）。
 
 ---
 
-## 命名约定（避免混淆）
+## 功能一览
 
-| 名称 | 含义 | 何时使用 |
-|---|---|---|
-| **MindEngine** | 新项目正式名称（后端 + 后续整体品牌） | 本文档全部设计、新仓库、新 API、新部署 |
-| **MindMem** | 旧项目/参考实现（本 monorepo 现有代码） | 仅指 legacy 代码、git tag `v0.97`、行为对齐基准 |
-| **小白（XiaoBai）** | AI 聊天伙伴名称（中文「小白」，英文 XiaoBai） | system prompt、前端 UI、用户可见文案 |
-| **MemoBot** | legacy AI 名称（**已废弃**） | 仅反查旧代码时使用，MindEngine 不得出现 |
-| `backend/`（旧称 `mindengine-server/`）| monorepo 内新后端代码根 | 🔄 v1.1：统一用 `backend/`，与前端 `frontend/` 同仓 |
-| `mindmem/` | legacy 仓库目录名（与 MindEngine 新项目无关） | 反查 legacy 代码路径时使用 |
-| `v0.97` / `v1.2.3` | **v0.97** = legacy 代码 git tag；**v1.2.3** = 功能完整度目标（人格契约、评估落盘等） | 两者指同一套参考实现，只是 tag 名 ≠ 功能版本号 |
+| 模块 | 能力 |
+| --- | --- |
+| **聊天** | SSE 流式回复；客户端断连后 assistant 消息仍落库（含 `prompt_meta`）；首句自动填会话标题 |
+| **记忆路由** | 三层 Memory Router（硬规则 → intent 分类 → 策略查表）；按 intent 决定加载哪些记忆层 |
+| **四层记忆** | profile / event / episodic / relationship；聊天后 Celery 异步抽取 |
+| **记忆去重** | 抽取时 pgvector ANN + 事件标题归一；历史批量清理 `scripts/dedup_memories.py` |
+| **记忆纠错** | 用户对话中纠错 → 软删旧记忆 + 实体封禁 + `memory_deprecations` 审计 |
+| **Prompt 归档** | 每条 assistant 回复旁路落盘完整 system/user/reply JSON；Prompt 抽屉可加载 |
+| **关系图谱** | 多层径向布局（via 二阶关系）、角色着色、`profile.name` 优先作中心节点 |
+| **评测实验室** | 合成评测 smoke(20) / full(55)；报告落盘；历史 run 查看/删除 |
+| **认证** | JWT + Argon2；`change-password` API；`reset_password.py` CLI |
+| **自检** | `selftest/run.py` 端到端 27 项检查（环境 / API / 记忆抽取召回 / 清理） |
 
-> **给 Opus 4.7**：你要写的是 **MindEngine**，AI 伙伴叫 **小白（XiaoBai）**。文中 MindMem / MemoBot 一律指 legacy 参考实现，不是目标名称。
-
----
-
-## 阅读顺序
-
-| # | 文档 | 给谁看 | 什么时候读 |
-|---|---|---|---|
-| 00 | [README.md](./README.md) | 所有人 | 入场 |
-| 01 | [01-PRD.md](./01-PRD.md) | 产品/工程 | 重写前 · 理解"做什么" |
-| 02 | [02-TDD.md](./02-TDD.md) | 工程 | 重写前 · 看总架构 |
-| 03 | [03-Subsystem-Memory-Router.md](./03-Subsystem-Memory-Router.md) | 工程 | 实现 Layer 2/3 之前 |
-| 04 | [04-Subsystem-Personality.md](./04-Subsystem-Personality.md) | 工程 | 实现 prompt composer 之前 |
-| 05 | [05-Subsystem-Memory-Layers.md](./05-Subsystem-Memory-Layers.md) | 工程 | 实现记忆抽取/读取之前 |
-| 06 | [06-Subsystem-Correction.md](./06-Subsystem-Correction.md) | 工程 | M4 阶段实现 |
-| 07 | [07-Subsystem-Eval-Lab.md](./07-Subsystem-Eval-Lab.md) | 工程 | M4 阶段实现 |
-| 08 | [08-Data-Model.md](./08-Data-Model.md) | 工程 | 建库前 |
-| 09 | [09-LLM-Strategy.md](./09-LLM-Strategy.md) | 工程 | 写第一行 LLM 调用前 |
-| 10 | **[10-Lessons-Learned.md](./10-Lessons-Learned.md)** | **必读** | **重写前 + 实现每个模块前都对照一次** |
-| 11 | [11-Roadmap.md](./11-Roadmap.md) | PM/工程 | 排期 |
-| 12 | [12-Brand-XiaoBai.md](./12-Brand-XiaoBai.md) | 工程/设计 | 实现 prompt + 前端前 · **小白命名与头像规范** |
-| — | [xiaobai-avatar.png](./xiaobai-avatar.png) | Coding Agent | **品牌头像原文件**（直接 Read / 复制到新项目） |
+前端五个视图：`LoginView` · `ChatView` · `MemoryView` · `SocialGraphView` · `EvalView`。
 
 ---
 
-## 重构的"必须保留"
-
-1. **四层记忆**：profile / event / episodic / relationship —— 不要降级成两层或三层
-2. **Memory Router v1.5 三层架构**：硬规则 / 小模型 intent / 策略查表 —— 是已经验证的最优解
-3. **人格契约**：可执行硬指标（字数 / 反问 / 引用），不是文字描述
-4. **在线记忆纠错**：用户在对话中纠错时 AI 必须立刻软删旧记忆 + 实体硬封禁
-5. **审计可追溯**：`prompt_meta` 必须随每条 assistant 消息持久化（前端透明 + 真实聊天评估的基础）
-6. **评测实验室**：合成评测 + 真实聊天评估 双路并行
-7. **零 thinking-mode**：所有 Qwen 调用必须显式 `enable_thinking=False`
-8. **小白（XiaoBai）品牌**：AI 伙伴统一称「小白」，头像见 `docs/rebuild/xiaobai-avatar.png`（见 [12-Brand-XiaoBai.md](./12-Brand-XiaoBai.md)）
-
-## 重构的"必须改掉"
-
-参见 [10-Lessons-Learned.md](./10-Lessons-Learned.md)，最严重的几条：
-
-1. ❌ Prompt 组件耦合 `route` 对象，导致测试要构造大量样板
-2. ❌ 异步任务（Celery）写库与 Web 请求写库共用同一 SQLAlchemy 引擎，并发冲突
-3. ❌ `prompt_meta` 存储在 `Message.meta` 的子字段里，schema 漂移
-4. ❌ Mem0 / Qdrant 直接耦合在业务代码里，难替换难测 → 🔄 v1.1：直接砍掉 Mem0/Qdrant，episodic 改 pgvector，仍走 EpisodicRepository 抽象（见 [08](./08-Data-Model.md) §3）
-5. ❌ 评测脚本和生产代码混在 `backend/scripts/`，部署上线要小心排除
-6. ❌ `_SECTION_HEADERS` 硬编码字符串匹配 prompt 段落，每次 prompt 改动就要同步改这里
-
----
-
-## 推荐项目结构（MindEngine 新仓库）
-
-> 🔄 **修订 v1.1· 仓库结构澄清**：本项目仓库根即 `mindengine/`（当前 GitHub repo）。采用 **monorepo**：后端在 `backend/`（即下文结构，原 `mindengine-server/` 仅为目录名别称，统一用 `backend/`），前端在 `frontend/`。文中凡 `mindengine-server/` 一律理解为本仓库的 `backend/`。
+## 系统架构
 
 ```
-backend/                       # MindEngine 新后端代码根（monorepo 内）
-├── app/
-│   ├── api/                   # FastAPI 路由层（薄）
-│   │   ├── chat.py
-│   │   ├── conversations.py
-│   │   ├── memory.py
-│   │   ├── eval.py
-│   │   └── correction.py
-│   ├── domain/                # 领域模型 (Pydantic)
-│   │   ├── memory.py          # 四层记忆 DTO
-│   │   ├── personality.py     # 人格契约
-│   │   ├── route.py           # MemoryRoute / RoutedMemory
-│   │   └── prompt.py          # PromptPack / PromptMeta
-│   ├── services/              # 业务逻辑（无 DB / 无网络的纯逻辑优先）
-│   │   ├── memory_router/     # intent_classifier + router + context loader
-│   │   ├── prompt_composer/   # base + intent_guides + contracts + render
-│   │   ├── correction/        # 纠错管线
-│   │   └── eval/              # 评测（合成 + 真实）
-│   ├── infra/                 # 基础设施适配层（可替换）
-│   │   ├── llm/               # LLM client 抽象（OpenAI 兼容 / Anthropic / 本地）
-│   │   ├── vector/            # 🔄 v1.1: pgvector 适配（episodic 语义检索；Repository 抽象保留可替换性）
-│   │   ├── db/                # SQLAlchemy + Alembic（Postgres）
-│   │   └── queue/             # Celery / arq / 替代品抽象
-│   └── workers/               # 异步任务定义（依赖 services + infra）
-├── tests/
-│   ├── unit/                  # 纯逻辑测试（无 DB / 无网络）
-│   ├── integration/           # 走 Postgres / pgvector 的集成测试（testcontainers）
-│   └── fixtures/              # 评测 case + chat_audit 样本
-├── scripts/                   # 一次性运维脚本（独立于 app/）
-├── alembic/                   # DB schema 迁移
-└── pyproject.toml
+浏览器
+  │
+  ▼
+frontend (nginx :5173)  ──反代──▶  backend (FastAPI :8000)
+                                        │
+                    ┌───────────────────┼───────────────────┐
+                    ▼                   ▼                   ▼
+              Postgres            Redis              prompt/eval 落盘
+            (+ pgvector)         (broker/cache)         (可选 volume)
+                    ▲
+                    │
+              celery + celery-beat
+              (memory.extract_* / correction)
 ```
 
-> **核心原则**：`services/` 是纯逻辑，`infra/` 是适配，`api/` / `workers/` 是入口。
-> 这样 80% 代码（services + domain）可以零基础设施依赖跑 pytest。
+| 服务 | 镜像 / 构建 | 端口 | 职责 |
+| --- | --- | --- | --- |
+| `postgres` | `pgvector/pgvector:pg16` | 5432 | 业务数据 + episodic 向量（HNSW） |
+| `redis` | `redis:7-alpine` | 6379 | Celery broker、intent 缓存 |
+| `backend` | `mindengine-backend:latest` | 8000 | HTTP API、SSE 聊天 |
+| `celery` | 同上 | — | 记忆抽取、纠错后台任务 |
+| `celery-beat` | 同上 | — | 定时任务（如有） |
+| `frontend` | `mindengine-frontend:latest` | 5173→80 | 静态 SPA + `/api` 反代 |
+
+LLM 调用经 `LLMRouter` 按角色路由（chat / extract / intent / judge），默认对接 DashScope `qwen-plus` 等模型；所有调用显式 `enable_thinking=false`。
 
 ---
 
-## 参考实现
+## 目录结构
 
-MindEngine 的设计文档要**独立可读**，但有不确定的地方可以反查 legacy MindMem 参考实现：
+```
+mindengine/
+├── backend/
+│   ├── app/
+│   │   ├── api/              # FastAPI 路由（auth, chat, conversations, memory, eval, health）
+│   │   ├── domain/           # Pydantic 领域模型（memory, personality, route, prompt, correction）
+│   │   ├── services/         # 业务逻辑（memory_router, prompt_composer, memory_extract, eval_synthetic, …）
+│   │   ├── infra/            # DB / LLM / 仓储适配（repositories, dashscope, pgvector）
+│   │   └── workers/          # Celery 任务定义 + runners（抽取、纠错执行体）
+│   ├── scripts/              # 运维 CLI（dedup_memories, reset_password, smoke_m4）
+│   ├── selftest/             # 端到端自检 + refresh-and-run.sh 热更新脚本
+│   ├── eval/cases/           # 合成评测用例 JSON（smoke_cases, full_cases）
+│   ├── alembic/              # 数据库迁移
+│   ├── tests/                # pytest 单元 / 集成测试
+│   └── docker-compose.yml    # 全栈编排（从此目录启动）
+├── frontend/
+│   ├── src/views/            # 五个主视图
+│   ├── src/components/       # PromptDrawer, SyntheticReportView, …
+│   └── refresh-and-deploy.sh # 构建 dist 并同步进 frontend 容器
+├── docs/rebuild/             # 架构设计文档（PRD、TDD、子系统设计）— 参考用
+└── CHANGELOG/                # 版本发布记录
+```
 
-- 参考实现位置：本仓库 `backend/`（legacy 项目名 **MindMem**，仓库目录名常为 `mindmem/`，tag `v0.97`，commit `66bc075`）
-- 自测脚本：`backend/scripts/selftest_p0.py` —— **MindEngine 必须复现的所有关键不变式**（112 个 case，能跑通 = 行为对齐）
+分层约定（`services/` 不直接 import ORM；`infra/` 实现 `Protocol`；`api/` / `workers/` 是入口）见 `docs/rebuild/02-TDD.md` §1.2。
 
 ---
 
-## 重构成功的判据
+## 快速开始
 
-| # | 判据 | 验证方式 |
-|---|---|---|
-| 1 | 新后端能让现有前端工作（API 适配后） | 跑通现有 5 类 EvalView Tab |
-| 2 | 自测 100+ 项全过 | 移植 `selftest_p0.py` 到 MindEngine 并通过 |
-| 3 | 同一份合成 case，通过率 ≥ legacy MindMem | 跑 smoke 20 / full 50，对比 v0.97 baseline |
-| 4 | 真实聊天评估 L0/L1 报告字段完全对齐 | 对比同一份 `chat_audit_v1` 输出 |
-| 5 | 重写后核心代码精简（**参考目标** ~7000 行，非硬门槛） | wc -l app/services/ + app/domain/，对比 legacy ~10k。🔄 v1.1：降级为参考目标，避免为压行数写密集/聪明代码而牺牲可读性 |
-| 6 | services/ 层 100% 可在无 DB 环境跑 unit test | pytest tests/unit/ 不需要任何容器 |
+### 1. 配置环境变量
+
+```bash
+cd backend
+cp .env.example .env
+```
+
+至少修改：
+
+| 变量 | 说明 |
+| --- | --- |
+| `OPENAI_API_KEY` | DashScope API Key |
+| `OPENAI_BASE_URL` | 默认 `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `JWT_SECRET` | 生产环境必须换掉默认值 |
+| `ALLOW_DESTRUCTIVE_DEV` | `1` 允许任意登录用户跑合成评测；`0` 仅 `EVAL_USER_ID` |
+
+完整列表见 `backend/app/config.py` 与 `.env.example`。
+
+### 2. 启动全栈
+
+```bash
+cd backend
+docker compose build
+docker compose up -d
+```
+
+- Web UI：`http://<host>:5173`
+- API 文档：`http://<host>:8000/docs`
+- 健康检查：`GET /healthz`、`GET /readyz`
+
+### 3. 验证
+
+```bash
+docker compose exec backend python -m selftest.run
+# 期望：PASS=27  WARN=0  FAIL=0
+```
+
+注册账号 → 登录 → 聊几轮 → 打开「记忆」页确认 profile / episodic 有数据（Celery 抽取需几秒）。
 
 ---
 
-最后更新：2026-06-07 · MindEngine rebuild · 行为基准：legacy MindMem v0.97
+## 日常开发与热更新
+
+完整 `docker compose build` 较慢。改 Python / 前端静态文件时，可用热更新脚本把改动 cp 进**正在运行的容器**，再 restart 相关服务。
+
+### 后端 + Celery
+
+```bash
+cd backend
+./selftest/refresh-and-run.sh          # 同步代码 + 跑 selftest
+./selftest/refresh-and-run.sh --keep-data   # 保留测试用户数据
+```
+
+脚本会 `docker compose cp` 变更目录到 `backend` / `celery` 容器，清理 `._*` 元数据文件，并重启服务。覆盖范围见脚本内注释（`app/`, `workers/`, `scripts/`, `eval/cases/` 等）。
+
+### 前端
+
+```bash
+cd frontend
+./refresh-and-deploy.sh                # 需要宿主机有 Node + npm
+./refresh-and-deploy.sh --skip-build   # 仅同步已有 dist/ 进容器
+```
+
+构建产物通过 `docker compose cp dist/. frontend:/usr/share/nginx/html/` 写入 nginx 容器。
+
+### 常用运维 CLI
+
+在 `backend` 容器内执行：
+
+```bash
+# 历史记忆去重（先 dry-run 预览）
+docker compose exec backend python -m scripts.dedup_memories --dry-run
+docker compose exec backend python -m scripts.dedup_memories
+
+# 重置用户密码（需 shell 权限，不走 HTTP）
+docker compose exec backend python scripts/reset_password.py \
+  --email user@example.com --password 'new-password'
+```
+
+`scripts/` 必须逐文件 cp 到 `/app/scripts/`（不要 `cp ./scripts backend:/app/scripts` 整个目录，会在容器内嵌套成 `/app/scripts/scripts/`）。
+
+---
+
+## 测试
+
+| 层级 | 命令 | 说明 |
+| --- | --- | --- |
+| 单元测试 | `cd backend && pytest tests/` | 纯逻辑 + fake repo，无需容器 |
+| 端到端 | `docker compose exec backend python -m selftest.run` | 依赖运行中的全栈 + LLM Key |
+| M4 冒烟 | `docker compose exec backend python scripts/smoke_m4.py` | 纠错 + 评测子系统 |
+| 合成评测 | 前端「评测实验室」或 `POST /api/eval/synthetic/{name}/start` | smoke ≈ 30–60s，同步阻塞 |
+
+CI 友好检查：`ruff check app tests`、`pytest tests/unit/`。
+
+---
+
+## 关键 API 端点
+
+| 前缀 | 用途 |
+| --- | --- |
+| `/auth/*` | 注册、登录、`/me`、`change-password` |
+| `/api/chat` | SSE 流式聊天 |
+| `/api/conversations/*` | 会话 CRUD、消息列表、`/messages/{id}/prompt`（完整 Prompt 归档） |
+| `/api/memory/*` | 四层记忆读写、封禁实体、deprecations 审计 |
+| `/api/eval/*` | 合成评测、历史 run、chat audit |
+
+OpenAPI title：`MindEngine API`。前端通过 nginx 反代访问上述路径，无需额外 CORS 配置。
+
+---
+
+## 数据与迁移
+
+- **存储**：Postgres 单库；episodic embedding 在 `episodic_memories.embedding`（pgvector），无独立向量库。
+- **软删除**：记忆废弃走 `status='deprecated'` + `memory_deprecations` 审计表，不做物理删除。
+- **legacy 迁移**：不支持直接读取旧版 MindMem v0.97 数据库。需自行导出后按字段映射导入；episodic 向量建议重新抽取。详见 CHANGELOG Breaking changes。
+
+---
+
+## 文档索引
+
+| 文档 | 用途 |
+| --- | --- |
+| [CHANGELOG/v2.0.0.md](CHANGELOG/v2.0.0.md) | v2.0.0 发布说明 + v2.0.1–v2.0.2.8 补丁全记录 |
+| [docs/rebuild/](docs/rebuild/) | 架构设计原文（PRD、TDD、记忆层、纠错、评测、数据模型、D1–D9 决策） |
+| [backend/README.md](backend/README.md) | 后端分层约定与 M1 脚手架说明 |
+| [backend/.env.example](backend/.env.example) | 环境变量模板 |
+
+设计阶段文档描述的是「目标架构」；若与代码有出入，以代码和 CHANGELOG 为准。
+
+---
+
+## 命名约定
+
+| 名称 | 含义 |
+| --- | --- |
+| **MindEngine** | 本项目（后端 + 前端 + 部署） |
+| **小白 / XiaoBai** | AI 伙伴，用户可见名称 |
+| **MindMem** | 旧版参考实现（tag `v0.97`），仅作行为对齐基准 |
+| **MemoBot** | 已废弃旧名，新代码中不出现 |
+
+---
+
+最后更新：2026-06-14 · MindEngine v2.0.0
