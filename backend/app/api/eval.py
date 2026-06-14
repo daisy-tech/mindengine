@@ -32,6 +32,7 @@ from app.api.deps import (
     SessionDep,
     SettingsDep,
 )
+from app.config import Settings
 from app.domain.eval import EvalCase
 from app.infra.repositories import MessageRepo
 from app.services.eval_chat_review import (
@@ -48,8 +49,12 @@ from app.services.eval_synthetic import (
     DEFAULT_CASE_FILES,
     CaseLoadError,
     build_report,
+    delete_report,
     list_case_files,
+    list_reports,
     load_cases,
+    load_report,
+    save_report,
     seed_eval_persona,
 )
 from app.services.eval_synthetic.runner import (
@@ -105,14 +110,41 @@ async def list_synthetic(settings: SettingsDep) -> list[CaseFileInfo]:
 
 
 def _ensure_eval_user(user_id: str, settings_eval_user_id: str) -> None:
+    """Strict eval-user check — used by destructive endpoints (seed-persona).
+
+    ``settings.eval_user_id`` is a stable string (e.g. ``"eval-bot-zhangsan"``)
+    that's distinct from any real registered user's UUID, so this pin
+    prevents seed-persona from accidentally wiping a production user's
+    memory. See ``_ensure_synthetic_caller`` for the read-only synthetic
+    path which uses a softer check.
+    """
     if user_id != settings_eval_user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
-                f"synthetic endpoints require user_id == settings.eval_user_id "
+                f"this endpoint requires user_id == settings.eval_user_id "
                 f"({settings_eval_user_id!r})"
             ),
         )
+
+
+def _ensure_synthetic_caller(user_id: str, settings: Settings) -> None:
+    """Soft check for ``/synthetic/{name}/start``.
+
+    The synthetic runner (``ChatBackedSyntheticRunner``) is read-only:
+    it does not persist messages, does not dispatch celery tasks, and
+    always runs the router/composer against an empty ``MemoryContext``.
+    The only side effect is one entry in the LLM intent cache, scoped
+    to ``settings.eval_user_id`` (not the caller). So in dev mode it's
+    safe — and far more ergonomic — to let any logged-in user drive a
+    synthetic run from the frontend "开始评测" button.
+
+    In production (``allow_destructive_dev=False``) we still pin to
+    ``settings.eval_user_id`` for defense in depth.
+    """
+    if settings.allow_destructive_dev:
+        return
+    _ensure_eval_user(user_id, settings.eval_user_id)
 
 
 @router.post(
@@ -131,7 +163,21 @@ async def start_synthetic(
     main.lifespan). Tests can override that attribute or use the
     ``DEPENDENCY_OVERRIDES`` machinery to swap in a fake.
     """
-    _ensure_eval_user(user_id, settings.eval_user_id)
+    # Order matters: runner-injection check goes FIRST so the failure
+    # mode "lifespan forgot to wire synthetic_runner" surfaces no matter
+    # what {name} or auth identity the caller sends. Selftest leans on
+    # this to do a cheap sanity ping without burning LLM calls.
+    runner = getattr(request.app.state, "synthetic_runner", None)
+    if runner is None or not isinstance(runner, SyntheticCaseRunner):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "synthetic runner is not configured "
+                "(set app.state.synthetic_runner in lifespan)"
+            ),
+        )
+
+    _ensure_synthetic_caller(user_id, settings)
     safe_id_segment(name, label="case_set")
 
     fpath = Path(settings.eval_synthetic_cases_dir) / f"{name}.json"
@@ -144,16 +190,6 @@ async def start_synthetic(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
 
-    runner = getattr(request.app.state, "synthetic_runner", None)
-    if runner is None or not isinstance(runner, SyntheticCaseRunner):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "synthetic runner is not configured "
-                "(set app.state.synthetic_runner in lifespan)"
-            ),
-        )
-
     batch = SyntheticBatch(started_at=datetime.now(UTC).timestamp())
     for case in cases:
         outcome = await _safe_run(runner, case)
@@ -161,12 +197,116 @@ async def start_synthetic(
         batch.items.append(SyntheticRunResult(case=case, outcome=outcome, result=result))
     batch.finished_at = datetime.now(UTC).timestamp()
 
-    report = build_report(
-        batch,
-        run_id=datetime.now(UTC).strftime("%Y%m%d_%H%M%S"),
-        run_type=name,
+    # run_id 同时充当文件名(safe_id_segment 强制 [A-Za-z0-9_-]+),
+    # 加上随机后缀避免同一秒触发两次跑产生 ID 冲突。
+    run_id = (
+        datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        + "_"
+        + uuid.uuid4().hex[:6]
     )
+    report = build_report(batch, run_id=run_id, run_type=name)
+    # 落盘按 caller user_id 分目录,这样合成评测开放给非 EVAL_USER 的
+    # 普通登录用户(dev mode)时不会互相串数据。
+    try:
+        save_report(
+            root=settings.eval_synthetic_runs_dir,
+            user_id=_safe_user(user_id),
+            run_id=run_id,
+            report=report,
+        )
+    except (OSError, ValueError):
+        # 落盘失败不应该让整个评测请求失败 —— 报告已经在内存里返回给前端。
+        # 真正的问题在 `eval_synthetic_runs_dir` 配错或权限,日志会捕获。
+        pass
     return SyntheticReport(**report)
+
+
+# ─── synthetic 历史运行 ─────────────────────────────────────────────
+
+
+class StoredSyntheticSummary(BaseModel):
+    run_id: str
+    run_type: str
+    finished_at: str
+    total: int
+    passed: int
+    pass_rate: float
+
+
+class StoredSyntheticIndex(BaseModel):
+    items: list[StoredSyntheticSummary]
+
+
+@router.get("/synthetic/runs", response_model=StoredSyntheticIndex)
+async def list_synthetic_runs(
+    user_id: CurrentUserId,
+    settings: SettingsDep,
+) -> StoredSyntheticIndex:
+    """List the caller's saved synthetic-run reports (newest first).
+
+    Used by the frontend to populate the "历史评测" list — clicking an
+    item then GETs ``/synthetic/runs/{run_id}`` for the full report
+    without needing to re-run.
+    """
+    items = list_reports(
+        root=settings.eval_synthetic_runs_dir,
+        user_id=_safe_user(user_id),
+    )
+    return StoredSyntheticIndex(
+        items=[
+            StoredSyntheticSummary(
+                run_id=it.run_id,
+                run_type=it.run_type,
+                finished_at=it.finished_at,
+                total=it.total,
+                passed=it.passed,
+                pass_rate=it.pass_rate,
+            )
+            for it in items
+        ]
+    )
+
+
+@router.get("/synthetic/runs/{run_id}", response_model=SyntheticReport)
+async def get_synthetic_run(
+    run_id: str,
+    user_id: CurrentUserId,
+    settings: SettingsDep,
+) -> SyntheticReport:
+    safe_id_segment(run_id, label="run_id")
+    payload = load_report(
+        root=settings.eval_synthetic_runs_dir,
+        user_id=_safe_user(user_id),
+        run_id=run_id,
+    )
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No saved report for that run_id",
+        )
+    return SyntheticReport(**payload)
+
+
+@router.delete(
+    "/synthetic/runs/{run_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_synthetic_run(
+    run_id: str,
+    user_id: CurrentUserId,
+    settings: SettingsDep,
+) -> None:
+    safe_id_segment(run_id, label="run_id")
+    deleted = delete_report(
+        root=settings.eval_synthetic_runs_dir,
+        user_id=_safe_user(user_id),
+        run_id=run_id,
+    )
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No saved report for that run_id",
+        )
 
 
 async def _safe_run(

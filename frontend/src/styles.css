@@ -306,6 +306,38 @@ a {
   color: var(--xb-purple-dark);
 }
 
+/* 评测通过率的颜色提示(供 EvalView 历史列表用) */
+.rate-good {
+  color: #16a34a;
+  font-weight: 600;
+}
+.rate-bad {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+/*
+ * Profile 画像的 dt/dd 排版:左侧标签 100px,右侧值跟随。
+ * 用 dl 而不是 table 是因为字段是松散的属性表(可有可无),
+ * table 在缺字段时空格太多。
+ */
+.kv-list {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  gap: 6px 12px;
+  margin: 0;
+}
+.kv-list dt {
+  color: var(--xb-muted);
+  font-size: 13px;
+}
+.kv-list dd {
+  margin: 0;
+  color: var(--xb-text);
+  font-size: 13px;
+  word-break: break-word;
+}
+
 .tag-row {
   display: flex;
   flex-wrap: wrap;

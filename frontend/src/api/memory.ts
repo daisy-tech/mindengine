@@ -28,10 +28,12 @@ export interface Event {
 
 export interface EpisodicMemory {
   id: string;
-  title?: string;
-  summary?: string;
-  content: string;
+  // Backend field is `text` (see app/domain/memory.py::EpisodicMemory).
+  // We previously declared `title` / `content` here, which silently
+  // returned undefined and rendered as blank rows in the UI.
+  text: string;
   source_message_id?: string | null;
+  source?: string | null;
   status?: string;
   created_at?: string;
 }

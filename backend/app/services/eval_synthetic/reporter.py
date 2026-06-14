@@ -28,11 +28,35 @@ def build_report(
 
     cases_payload: list[dict[str, Any]] = []
     for it in batch.items:
+        # Surface the inputs (``user`` / ``history``) and ``expected`` block
+        # in the report so the frontend can render a "what did we ask vs.
+        # what did we get back" failure card without needing a second
+        # round-trip to fetch the case definition.
         cases_payload.append(
             {
                 "id": it.case.id,
                 "personality": it.case.personality.value,
                 "tags": list(it.case.tags),
+                "user": it.case.user,
+                "history": [
+                    {"role": h.role, "content": h.content} for h in it.case.history
+                ],
+                "expected": {
+                    "intents": [i.value for i in it.case.expected.intents],
+                    "optional_intents": [
+                        i.value for i in it.case.expected.optional_intents
+                    ],
+                    "must_activate_keywords": list(
+                        it.case.expected.must_activate_keywords
+                    ),
+                    "must_contain": list(it.case.expected.must_contain),
+                    "forbidden_phrases_in_reply": list(
+                        it.case.expected.forbidden_phrases_in_reply
+                    ),
+                    "forbidden_phrases_in_system": list(
+                        it.case.expected.forbidden_phrases_in_system
+                    ),
+                },
                 "passed": it.result.passed,
                 "intent_actual": it.outcome.intent,
                 "intent_source": it.outcome.intent_source,

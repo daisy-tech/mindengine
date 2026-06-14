@@ -59,6 +59,21 @@ class Settings(BaseSettings):
     # ─── eval
     eval_chat_reviews_dir: str = "/app/eval/exports/reviews"
     eval_synthetic_cases_dir: str = "/app/eval/cases"
+    # 合成评测「上次结果」每次跑完落盘到这里,前端可凭 run_id 反查;
+    # 不写盘的话用户每次都要等 1~6 分钟跑完才能看到一次结果。
+    eval_synthetic_runs_dir: str = "/app/eval/exports/synthetic"
+    # Prompt archive 旁路落盘:每条 assistant message 写一个独立 JSON,
+    # 包括完整 system + user + reply,供 prompt 调优时逐条复看。
+    # 设为空字符串可关闭(归档磁盘吃紧时);默认开启。
+    prompt_archive_dir: str = "/app/eval/exports/prompts"
+    # 抽取去重阈值。情景层用 pgvector ANN 余弦相似度;同一只猫"奶黄"
+    # 的 18 条重复记忆都来自这里没拦住(v2.0.2.7 之前完全没这环节)。
+    # 0.90 是中文 embedding 实测的合理起点 —— 同义改写能命中,但语序
+    # 翻转的真新事实("用户养了奶黄" vs "奶黄是用户养的")不会误杀。
+    episodic_dedup_threshold: float = 0.90
+    # 事件层(无 embedding)用 (type, normalized_title) 字符串去重;
+    # 30 天窗口足够覆盖同一段时间内反复说同一件事的场景。
+    event_dedup_window_days: int = 30
     eval_pass_threshold: float = 0.85
     judge_enabled: bool = False
     eval_user_id: str = "eval-bot-zhangsan"

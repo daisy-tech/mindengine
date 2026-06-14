@@ -66,6 +66,49 @@ class EpisodicRepo:
             hits.append(EpisodicHit(id=row.id, text=row.text, score=sim))
         return hits
 
+    async def find_similar(
+        self,
+        text: str,
+        *,
+        threshold: float = 0.90,
+    ) -> EpisodicHit | None:
+        """Return the most similar **active** episodic memory if its
+        cosine similarity is ≥ ``threshold``, else ``None``.
+
+        Used by the worker to skip inserting "用户养了一只奶黄的猫" again
+        when a near-identical fact already exists. See doc 05 §5.4 ("不
+        要无脑追加,先 ANN 一次"); this is the second-half of the lesson
+        that the original implementation skipped.
+
+        Implementation note: reuses pgvector's HNSW index via the same
+        ``cosine_distance`` operator as ``search``; one extra ANN call per
+        candidate fact (≈ 5–10 ms on a few thousand rows). We deliberately
+        do NOT use ``search`` because that one returns a list — here we
+        only need the single nearest, and the threshold check is much
+        easier to reason about as a tight branch.
+        """
+        if not text or not text.strip():
+            return None
+        q_vec = await self.embedder.embed(text)
+        distance = EpisodicMemoryRow.embedding.cosine_distance(q_vec).label("distance")
+        stmt = (
+            select(EpisodicMemoryRow, distance)
+            .where(
+                EpisodicMemoryRow.user_id == self.user_id,
+                EpisodicMemoryRow.status == "active",
+            )
+            .order_by(distance)
+            .limit(1)
+        )
+        row = (await self.session.execute(stmt)).first()
+        if row is None:
+            return None
+        memory_row, dist = row
+        sim = max(0.0, min(1.0, 1.0 - float(dist) / 2.0))
+        if sim < threshold:
+            return None
+        return EpisodicHit(id=memory_row.id, text=memory_row.text, score=sim)
+
     async def soft_delete(self, mem_id: str, reason: str) -> None:
         _ = reason  # logged via DeprecationRepo
         stmt = (

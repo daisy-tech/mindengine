@@ -88,6 +88,25 @@ def test_list_case_files_returns_sorted(tmp_path):
     assert out == ["a.json", "b.json"]
 
 
+def test_list_case_files_skips_appledouble(tmp_path):
+    """macOS / NFS produces ``._foo.json`` AppleDouble metadata files
+    that match ``*.json`` but are binary blobs. They must not surface."""
+    (tmp_path / "real.json").write_text("[]")
+    (tmp_path / "._real.json").write_bytes(b"\x00\x05\x16\x07AppleDouble")
+    out = [p.name for p in list_case_files(tmp_path)]
+    assert out == ["real.json"]
+
+
+def test_load_cases_non_utf8_raises_caseloaderror(tmp_path):
+    """Reading an AppleDouble blob via ``load_cases`` must surface as
+    ``CaseLoadError`` (not a bare ``UnicodeDecodeError``) so the API
+    layer can convert it to 404 / skip instead of 500."""
+    f = tmp_path / "._sneaky.json"
+    f.write_bytes(b"\x00\x05\x16\x07\xff\xfe\xfd\xfc")
+    with pytest.raises(CaseLoadError):
+        load_cases(f)
+
+
 def test_load_named_set_short_name(tmp_path):
     _write_case(tmp_path / "smoke_cases.json")
     cases = load_named_set(tmp_path, "smoke")

@@ -32,6 +32,7 @@ from app.services.chat.history import history_to_messages
 from app.services.contract_guard import ContractGuard
 from app.services.memory_context import MemoryContextLoader
 from app.services.memory_router import MemoryRouter
+from app.services.prompt_archive import PromptArchive, build_payload
 from app.services.prompt_composer import PromptComposer
 from app.services.protocols import (
     ConversationRepository,
@@ -83,6 +84,10 @@ class ChatOrchestrator:
     dispatcher: TaskDispatcher
     history_window: int = 12
     chat_temperature: float = 0.7
+    # Optional 旁路 prompt 归档器。注入后,每个 assistant turn 会把
+    # 完整 (system, user, reply) 写到独立 JSON,供 prompt 评估使用;
+    # 不注入时聊天链路完全等价于改造前(测试/最小依赖部署友好)。
+    prompt_archive: PromptArchive | None = None
     _bg_tasks: set[asyncio.Task] = field(default_factory=set)
 
     async def stream_chat(
@@ -106,6 +111,13 @@ class ChatOrchestrator:
             conversation_id=conversation_id,
             message_id=user_msg_id,
             content=user_message,
+        )
+        # Auto-derive a sidebar title from the first user message of a
+        # conversation. ``set_title_if_empty`` is a no-op once a title
+        # exists (so user-provided / model-generated titles aren't
+        # overwritten by later turns).
+        await repos.conversations.set_title_if_empty(
+            conversation_id, _derive_title(user_message)
         )
 
         # ─── (b) router → loader → composer.
@@ -172,6 +184,8 @@ class ChatOrchestrator:
                 user_msg_id=user_msg_id,
                 assistant_msg_id=assistant_msg_id,
                 user_id=user_id,
+                user_message=user_message,
+                llm_messages=llm_messages,
                 chunks=chunks,
                 completed=completed,
                 cancelled=cancelled,
@@ -197,6 +211,8 @@ class ChatOrchestrator:
         user_msg_id: str,
         assistant_msg_id: str,
         user_id: str,
+        user_message: str,
+        llm_messages: list[dict[str, str]],
         chunks: list[str],
         completed: bool,
         cancelled: bool,
@@ -221,6 +237,8 @@ class ChatOrchestrator:
             user_msg_id=user_msg_id,
             assistant_msg_id=assistant_msg_id,
             user_id=user_id,
+            user_message=user_message,
+            llm_messages=llm_messages,
             text=result.text,
             completed=completed,
             llm_error=llm_error,
@@ -242,6 +260,8 @@ class ChatOrchestrator:
         user_msg_id: str,
         assistant_msg_id: str,
         user_id: str,
+        user_message: str,
+        llm_messages: list[dict[str, str]],
         text: str,
         completed: bool,
         llm_error: str | None,
@@ -256,6 +276,27 @@ class ChatOrchestrator:
                 error=llm_error,
             )
             await repos.conversations.touch(conversation_id)
+            # 旁路落盘完整 prompt(供 prompt 评估迭代),失败被 archive
+            # 实现自身吞掉,绝不影响主链路。
+            if self.prompt_archive is not None:
+                payload = build_payload(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    user_message_id=user_msg_id,
+                    assistant_message_id=assistant_msg_id,
+                    user_message=user_message,
+                    assistant_reply=text or "",
+                    system_text=pack.system,
+                    llm_messages=llm_messages,
+                    meta_json=pack.meta.model_dump(mode="json"),
+                    composed_at=pack.meta.composed_at.isoformat(),
+                )
+                await self.prompt_archive.save(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    message_id=assistant_msg_id,
+                    payload=payload,
+                )
             # Per docs/rebuild/06-Subsystem-Correction.md §2: when the
             # routed intent is correction, fire the correction_cleanup
             # task INSTEAD of the after_chat fan-out. The two paths must
@@ -301,3 +342,22 @@ class ChatOrchestrator:
 
 def fresh_message_id(prefix: str = "m") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:24]}"
+
+
+def _derive_title(text: str, *, max_chars: int = 24) -> str:
+    """Take the first user message and turn it into a sidebar title.
+
+    Trim leading/trailing whitespace, collapse internal whitespace to a
+    single space, and clip to ``max_chars`` (CJK and ASCII counted the
+    same — the sidebar lays out by character count, not pixel width).
+    Returns ``""`` if the message has no usable content.
+    """
+    if not text:
+        return ""
+    # Collapse all whitespace runs (incl. newlines) to a single space.
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return ""
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars] + "…"

@@ -62,6 +62,24 @@ class ConversationRepo:
             return
         row.updated_at = when or datetime.now(UTC)
 
+    async def set_title_if_empty(self, conversation_id: str, title: str) -> bool:
+        """Set conversation title only if it's currently NULL/empty.
+
+        Used to auto-derive a sidebar title from the first user message
+        without overwriting a title the user explicitly set. Returns True
+        if a title was actually written.
+        """
+        row = await self.session.get(Conversation, conversation_id)
+        if row is None or row.user_id != self.user_id:
+            return False
+        if row.title:  # already has a non-empty title — leave it alone
+            return False
+        cleaned = (title or "").strip()
+        if not cleaned:
+            return False
+        row.title = cleaned[:80]
+        return True
+
     async def archive(self, conversation_id: str) -> bool:
         """Soft-delete a conversation. Returns True iff a row was flipped.
 

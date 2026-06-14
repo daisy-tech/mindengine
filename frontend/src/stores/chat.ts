@@ -107,6 +107,15 @@ export const useChatStore = defineStore('chat', {
         // Backend has the authoritative meta_json post-persist; refresh
         // so PromptDrawer renders the full PromptMeta.
         await this.reloadCurrent();
+        // 首句进来时后端会用 set_title_if_empty 自动回填会话标题,但
+        // 这里 store 里的 conversations 数组还停留在「title 为空」的
+        // 旧快照,侧栏会一直显示「新对话」直到刷新页面。所以只在
+        // 当前会话还没有 title 时拉一次列表把后端写回的 title 同步过来 ——
+        // 已经有 title 的轮次不需要每条消息都拉一次列表。
+        const cur = this.conversations.find((c) => c.id === this.activeId);
+        if (cur && !cur.title) {
+          this.conversations = await listConversations();
+        }
       } catch (e) {
         assistantTurn.pending = false;
         const msg = e instanceof Error ? e.message : String(e);

@@ -8,7 +8,7 @@ import pytest
 
 from app.domain.correction import BannedEntity
 from app.domain.llm import LLMRole
-from app.domain.memory import Profile, Relationship
+from app.domain.memory import EpisodicHit, Event, Profile, Relationship
 from app.infra.llm.mock_client import MockLLMClient
 from app.services.memory_extract import (
     EpisodicExtractor,
@@ -16,7 +16,11 @@ from app.services.memory_extract import (
     ProfileExtractor,
     RelationshipExtractor,
 )
+from app.services.memory_extract.relationship_extractor import (
+    RelationshipCandidate,
+)
 from app.workers.runners import (
+    _topo_sort_relationship_candidates,
     run_extract_episodic,
     run_extract_event,
     run_extract_profile,
@@ -133,6 +137,113 @@ async def test_run_extract_episodic_returns_zero_when_extractor_empty():
     )
     assert result == {"status": "ok", "inserted": 0}
     assert epi_repo.rows == []
+
+
+@pytest.mark.asyncio
+async def test_run_extract_episodic_skips_in_batch_duplicate_string():
+    """LLM 单轮内输出两条字面量相同的 fact —— 只能写入一条。
+
+    回归:旧实现下游 episodic_repo.add 会被调两次,产生两条。
+    """
+    msg_repo = FakeMessageRepo(user_id="u1")
+    _seed_msg(msg_repo, conversation_id="c1", message_id="m1",
+              content="奶黄又趴在我电脑边", user_id="u1")
+    epi_repo = FakeEpisodicRepo(user_id="u1")
+    banned = FakeBannedEntityRepo(user_id="u1")
+    extractor = EpisodicExtractor(
+        llm=MockLLMClient(role=LLMRole.EXTRACT).queue_json(
+            {
+                "facts": [
+                    "用户家里养了一只叫奶黄的猫",
+                    "用户家里养了一只叫奶黄的猫",  # 字面量重复
+                ]
+            }
+        )
+    )
+
+    result = await run_extract_episodic(
+        extractor=extractor,
+        message_repo=msg_repo,
+        episodic_repo=epi_repo,
+        banned_repo=banned,
+        conversation_id="c1",
+        message_id="m1",
+    )
+    # NOTE: EpisodicExtractor 自身已在 lower-cased set 里去过同字面量重复;
+    # 所以传到 worker 这里只有 1 条 — 但 worker 这层依然要兜底,所以
+    # 我们再压一次"模拟 extractor 没去重"的场景,见下一个 test。
+    assert result["inserted"] == 1
+    assert len(epi_repo.rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_extract_episodic_skips_when_similar_in_db():
+    """跨轮次重复:库里已存在同义旧记忆 —— ANN 命中后跳过。
+
+    这是 18 条「奶黄」重复的真正修复:之前 worker 完全不查库。
+    """
+    msg_repo = FakeMessageRepo(user_id="u1")
+    _seed_msg(msg_repo, conversation_id="c1", message_id="m1",
+              content="奶黄今天又来粘人", user_id="u1")
+    epi_repo = FakeEpisodicRepo(
+        user_id="u1",
+        # FakeEpisodicRepo.find_similar 会返回 search_results[0],
+        # 只要 score >= threshold 就视为重复。0.95 高于默认 0.90。
+        search_results=[
+            EpisodicHit(id="m_old", text="用户家里养了一只叫奶黄的猫", score=0.95)
+        ],
+    )
+    banned = FakeBannedEntityRepo(user_id="u1")
+    extractor = EpisodicExtractor(
+        llm=MockLLMClient(role=LLMRole.EXTRACT).queue_json(
+            {"facts": ["用户家里养了一只叫奶黄的猫"]}
+        )
+    )
+
+    result = await run_extract_episodic(
+        extractor=extractor,
+        message_repo=msg_repo,
+        episodic_repo=epi_repo,
+        banned_repo=banned,
+        conversation_id="c1",
+        message_id="m1",
+    )
+    assert result["status"] == "ok"
+    assert result["inserted"] == 0
+    assert result["skipped_duplicate"] == 1
+    assert epi_repo.rows == []  # 没插入
+
+
+@pytest.mark.asyncio
+async def test_run_extract_episodic_keeps_when_below_threshold():
+    """语义不够近(score < threshold) —— 仍然插入,避免误杀。"""
+    msg_repo = FakeMessageRepo(user_id="u1")
+    _seed_msg(msg_repo, conversation_id="c1", message_id="m1",
+              content="我新养了一只小狗叫旺财", user_id="u1")
+    epi_repo = FakeEpisodicRepo(
+        user_id="u1",
+        search_results=[
+            EpisodicHit(id="m_old", text="用户家里养了一只叫奶黄的猫", score=0.55)
+        ],
+    )
+    banned = FakeBannedEntityRepo(user_id="u1")
+    extractor = EpisodicExtractor(
+        llm=MockLLMClient(role=LLMRole.EXTRACT).queue_json(
+            {"facts": ["用户养了一只叫旺财的狗"]}
+        )
+    )
+
+    result = await run_extract_episodic(
+        extractor=extractor,
+        message_repo=msg_repo,
+        episodic_repo=epi_repo,
+        banned_repo=banned,
+        conversation_id="c1",
+        message_id="m1",
+    )
+    assert result["inserted"] == 1
+    assert result["skipped_duplicate"] == 0
+    assert len(epi_repo.rows) == 1
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -276,6 +387,79 @@ async def test_run_extract_event_skips_when_message_missing():
     assert event_repo.rows == []
 
 
+@pytest.mark.asyncio
+async def test_run_extract_event_skips_in_batch_duplicate():
+    """LLM 单轮输出两条同 (type, title) — 只能保留一条。"""
+    msg_repo = FakeMessageRepo(user_id="u1")
+    _seed_msg(msg_repo, conversation_id="c1", message_id="m1",
+              content="今天宅家学AI,顺便又复习了下AI", user_id="u1")
+    event_repo = FakeEventRepo(user_id="u1")
+    extractor = EventExtractor(
+        llm=MockLLMClient(role=LLMRole.EXTRACT).queue_json(
+            {
+                "events": [
+                    {"type": "experience", "title": "宅家学习AI", "content": "今天"},
+                    {"type": "experience", "title": "宅家学习AI", "content": "复习"},
+                ]
+            }
+        )
+    )
+
+    result = await run_extract_event(
+        extractor=extractor,
+        message_repo=msg_repo,
+        event_repo=event_repo,
+        user_id="u1",
+        conversation_id="c1",
+        message_id="m1",
+    )
+    assert result["inserted"] == 1
+    assert result["skipped_duplicate"] == 1
+    assert len(event_repo.rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_extract_event_skips_when_existing_in_window():
+    """库里已经有相同 (type, title) 的近期事件 — 跳过。"""
+    msg_repo = FakeMessageRepo(user_id="u1")
+    _seed_msg(msg_repo, conversation_id="c1", message_id="m2",
+              content="今天又是宅家学AI的一天", user_id="u1")
+    existing = Event(
+        id="evt_old",
+        user_id="u1",
+        type="experience",
+        title="宅家学习AI",
+        content="昨天宅家学AI",
+        occurred_at=None,
+        source_message_id="m_old",
+        created_at=datetime.now(UTC),
+    )
+    event_repo = FakeEventRepo(user_id="u1", rows=[existing])
+    extractor = EventExtractor(
+        llm=MockLLMClient(role=LLMRole.EXTRACT).queue_json(
+            {
+                "events": [
+                    {"type": "experience", "title": "宅家学习AI", "content": "今天"},
+                ]
+            }
+        )
+    )
+
+    result = await run_extract_event(
+        extractor=extractor,
+        message_repo=msg_repo,
+        event_repo=event_repo,
+        user_id="u1",
+        conversation_id="c1",
+        message_id="m2",
+    )
+    assert result["inserted"] == 0
+    assert result["skipped_duplicate"] == 1
+    # 只有原本那一条
+    assert len(event_repo.rows) == 1
+    assert event_repo.rows[0].id == "evt_old"
+
+
 # ─────────────────────────────────────────────────────────────────
 # Relationship
 # ─────────────────────────────────────────────────────────────────
@@ -406,3 +590,123 @@ async def test_run_extract_relationship_drops_via_when_unresolvable():
     )
     rel = next(r for r in rel_repo.rows if r.name == "老李")
     assert rel.via is None
+
+
+# ─── _topo_sort_relationship_candidates 单测(纯函数,无 IO)─────────
+
+
+def _cand(name: str, via: str | None = None) -> RelationshipCandidate:
+    return RelationshipCandidate(name=name, role="朋友", via_name=via)
+
+
+def test_topo_sort_empty_and_singleton():
+    assert _topo_sort_relationship_candidates([]) == []
+    one = [_cand("儿子")]
+    assert _topo_sort_relationship_candidates(one) == one
+
+
+def test_topo_sort_sons_friends_in_same_batch():
+    """截图原始 case:儿子 + 两个朋友(via=儿子)同时出现,儿子必须排第一。"""
+    got = [
+        c.name
+        for c in _topo_sort_relationship_candidates(
+            [
+                _cand("小孙孙", via="儿子"),
+                _cand("儿子"),
+                _cand("小魏魏", via="儿子"),
+            ]
+        )
+    ]
+    assert got[0] == "儿子", got
+    assert set(got[1:]) == {"小孙孙", "小魏魏"}, got
+
+
+def test_topo_sort_three_tier_chain():
+    """三阶链:老婆 → 张姐(同事) → 小客户。中间人都在同批里。"""
+    got = [
+        c.name
+        for c in _topo_sort_relationship_candidates(
+            [
+                _cand("小客户", via="张姐"),
+                _cand("张姐", via="老婆"),
+                _cand("老婆"),
+            ]
+        )
+    ]
+    assert got == ["老婆", "张姐", "小客户"], got
+
+
+def test_topo_sort_external_via_treated_as_tier1():
+    """via_name 不在本批 names 里 —— 当 tier1 处理,不当依赖。"""
+    got = [
+        c.name
+        for c in _topo_sort_relationship_candidates(
+            [_cand("小客户", via="张姐_不在批里")]
+        )
+    ]
+    assert got == ["小客户"], got
+
+
+def test_topo_sort_cycle_does_not_loop_forever():
+    """A↔B 互 via —— 兜底为原顺序,不死循环。"""
+    got = [
+        c.name
+        for c in _topo_sort_relationship_candidates(
+            [_cand("A", via="B"), _cand("B", via="A")]
+        )
+    ]
+    assert set(got) == {"A", "B"}, got
+
+
+def test_topo_sort_neighbor_with_pet():
+    """邻居老爷爷 + 他家的狗"可乐"(via=邻居老爷爷)。"""
+    got = [
+        c.name
+        for c in _topo_sort_relationship_candidates(
+            [_cand("可乐", via="邻居老爷爷"), _cand("邻居老爷爷")]
+        )
+    ]
+    assert got == ["邻居老爷爷", "可乐"], got
+
+
+@pytest.mark.asyncio
+async def test_run_extract_relationship_resolves_via_within_same_batch():
+    """同一批 candidates 里,via 中间人会被先 upsert,孩子节点的 via 能挂上。
+
+    这是最关键的回归 —— 没拓扑排序之前,先处理 "小孙孙" 时数据库里
+    还没有 "儿子",via_id 拿到 None,二阶链路被静默丢失。
+    """
+    rel_repo = FakeRelationshipRepo(user_id="u1")
+    msg_repo = FakeMessageRepo(user_id="u1")
+    _seed_msg(
+        msg_repo,
+        conversation_id="c1",
+        message_id="m1",
+        content="我儿子和他朋友小孙孙周末一起玩",
+        user_id="u1",
+    )
+    extractor = RelationshipExtractor(
+        llm=MockLLMClient(role=LLMRole.EXTRACT).queue_json(
+            {
+                "relationships": [
+                    # 故意把孩子节点放在父节点之前,模拟 LLM 输出顺序
+                    {"name": "小孙孙", "role": "朋友", "via_name": "儿子"},
+                    {"name": "儿子", "role": "儿子"},
+                ]
+            }
+        )
+    )
+    await run_extract_relationship(
+        extractor=extractor,
+        message_repo=msg_repo,
+        relationship_repo=rel_repo,
+        user_id="u1",
+        conversation_id="c1",
+        message_id="m1",
+    )
+    son = next(r for r in rel_repo.rows if r.name == "儿子")
+    friend = next(r for r in rel_repo.rows if r.name == "小孙孙")
+    assert son.via is None, "儿子是一阶,via 应为 None"
+    assert friend.via == son.id, (
+        f"小孙孙应当 via 儿子的 id;实际拿到 {friend.via!r},预期 {son.id!r}"
+    )

@@ -12,12 +12,20 @@ const draft = ref('');
 const streamEl = ref<HTMLDivElement | null>(null);
 const drawerOpen = ref(false);
 const drawerMeta = ref<Record<string, unknown> | null>(null);
+// 这两个跟着「点哪条 assistant 消息」一起设,PromptDrawer 用它们
+// 拉「完整 prompt 归档」端点。turn.id 在流式期间是 local-a-xxx,
+// reloadCurrent() 之后会被替换成真正的 message_id。
+const drawerConvId = ref<string>('');
+const drawerMsgId = ref<string>('');
 
 onMounted(async () => {
   try {
     await chat.refreshList();
     if (!chat.activeId && chat.conversations.length === 0) {
-      await chat.newConversation('新对话');
+      // 不传 title — 让后端在首句到达后用 set_title_if_empty 把 user
+      // 第一句话写进 title。如果这里传 '新对话',后端会把它当成
+      // 用户显式起的名字,首句永远不会覆盖,侧栏就一直叫「新对话」。
+      await chat.newConversation();
     }
   } catch (e: unknown) {
     ElMessage.error('加载会话失败');
@@ -50,12 +58,22 @@ async function send() {
 
 function inspect(turn: ChatTurn) {
   drawerMeta.value = turn.meta;
+  drawerConvId.value = chat.activeId;
+  // 流式期间 turn.id 是临时 local-a-xxx;归档接口要真正的 server message_id。
+  // server message_id 在流的 meta 事件里下发,store 已把它写到 turn.id;
+  // 但保险起见也尝试从 meta.message_id 读。
+  const fromMeta =
+    turn.meta && typeof turn.meta.message_id === 'string'
+      ? (turn.meta.message_id as string)
+      : '';
+  drawerMsgId.value = fromMeta || turn.id || '';
   drawerOpen.value = true;
 }
 
 async function newConv() {
   try {
-    await chat.newConversation('新对话');
+    // 同 onMounted:不传 title,首句到达后由后端自动回填。
+    await chat.newConversation();
   } catch (e: unknown) {
     ElMessage.error('新建会话失败');
     console.error(e);
@@ -113,7 +131,7 @@ function fmtTime(s: string): string {
         @click="chat.select(c.id)"
       >
         <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-          {{ c.title || c.id }}
+          {{ c.title || '新对话' }}
         </div>
         <el-button
           link
@@ -128,7 +146,13 @@ function fmtTime(s: string): string {
     <section class="chat-main">
       <div class="chat-toolbar">
         <div>
-          <strong>{{ chat.activeConversation?.title || '请选择会话' }}</strong>
+          <strong>
+            {{
+              chat.activeConversation
+                ? chat.activeConversation.title || '新对话'
+                : '请选择会话'
+            }}
+          </strong>
           <span v-if="chat.activeConversation" style="color:var(--xb-muted);margin-left:8px">
             {{ fmtTime(chat.activeConversation.updated_at) }}
           </span>
@@ -180,6 +204,11 @@ function fmtTime(s: string): string {
       </div>
     </section>
 
-    <PromptDrawer v-model="drawerOpen" :meta="drawerMeta" />
+    <PromptDrawer
+      v-model="drawerOpen"
+      :meta="drawerMeta"
+      :conversation-id="drawerConvId"
+      :message-id="drawerMsgId"
+    />
   </div>
 </template>

@@ -554,6 +554,36 @@ async def tier2_eval(api: Api, c: Counters) -> None:
     else:
         fail("GET /api/eval/chat-audit-stored", f"status={r.status_code}", c)
 
+    # synthetic_runner 注入 sanity check —— 我们只关心一件事:
+    # ``app.state.synthetic_runner`` 是否被 lifespan 正确注入。
+    # 不能直接 POST `/synthetic/.../start` 真跑评测(20 条 case × LLM 太贵),
+    # 改用 unknown case file 触发 404 —— 后端在 404 之前会先做 runner 检查,
+    # 所以 503 仍然能把缺失暴露出来,而 404 = runner 已注入但文件不存在。
+    r = await api.client.post(
+        "/api/eval/synthetic/__selftest_nonexistent__/start",
+        headers=api.auth_headers,
+    )
+    if r.status_code == 503:
+        fail(
+            "POST /api/eval/synthetic/.../start (runner 已注入)",
+            "503: app.state.synthetic_runner 未注入,见 main.py::lifespan",
+            c,
+        )
+    elif r.status_code in (403, 404):
+        # 403 = 严格模式 + 非 eval_user_id;404 = dev 模式 + 用例文件不存在。
+        # 两者都意味着 runner 已注入。
+        ok(
+            "POST /api/eval/synthetic/.../start (runner 已注入)",
+            f"{r.status_code} (lifespan OK)",
+            c,
+        )
+    else:
+        warn(
+            "POST /api/eval/synthetic/.../start (runner 已注入)",
+            f"unexpected status={r.status_code} body={r.text[:200]}",
+            c,
+        )
+
 
 async def tier2_memory_extraction(
     api: Api, c: Counters, *, llm_soft: bool, wait_s: float = 30.0

@@ -119,6 +119,7 @@ async def _run_episodic(user_id: str, conversation_id: str, message_id: str):
             banned_repo=BannedEntityRepo(session=session, user_id=user_id),
             conversation_id=conversation_id,
             message_id=message_id,
+            dedup_threshold=services.settings.episodic_dedup_threshold,
         )
         await session.commit()
         return result
@@ -151,6 +152,7 @@ async def _run_event(user_id: str, conversation_id: str, message_id: str):
             user_id=user_id,
             conversation_id=conversation_id,
             message_id=message_id,
+            dedup_window_days=services.settings.event_dedup_window_days,
         )
         await session.commit()
         return result

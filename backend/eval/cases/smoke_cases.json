@@ -3,7 +3,7 @@
     "id": "smoke-001-casual-balanced",
     "personality": "balanced",
     "history": [],
-    "user": "你好，今天还好吗",
+    "user": "你好,今天还好吗",
     "expected": {
       "intents": ["casual"],
       "forbidden_phrases_in_reply": ["[出错", "AI 服务异常"]
@@ -11,78 +11,33 @@
     "tags": ["casual", "first_turn"]
   },
   {
-    "id": "smoke-002-self-intro-followup",
-    "personality": "balanced",
-    "history": [
-      {"role": "user", "content": "我叫张三，老家湖南怀化"},
-      {"role": "assistant", "content": "记下来啦，张三老家在湖南怀化。"}
-    ],
-    "user": "你还记得我老家在哪儿吗",
-    "expected": {
-      "intents": ["memory_challenge"],
-      "must_activate_keywords": ["怀化"],
-      "forbidden_phrases_in_reply": ["[出错"]
-    },
-    "tags": ["memory_challenge", "post_intro"]
-  },
-  {
-    "id": "smoke-003-correction-hometown",
-    "personality": "balanced",
-    "history": [
-      {"role": "user", "content": "我老家湖南怀化"},
-      {"role": "assistant", "content": "怀化的米粉挺有名。"}
-    ],
-    "user": "不对，是怀宁，邻近安徽岳西",
-    "expected": {
-      "intents": ["correction"],
-      "must_contain": ["怀宁"],
-      "forbidden_phrases_in_reply": ["怀化", "已记录", "我会注意"]
-    },
-    "tags": ["correction", "geo"]
-  },
-  {
-    "id": "smoke-004-relationship-topic",
-    "personality": "extrovert",
-    "history": [
-      {"role": "user", "content": "我妻子叫李娜"},
-      {"role": "assistant", "content": "李娜，记下来啦。"}
-    ],
-    "user": "她最近工作有点累",
-    "expected": {
-      "intents": ["relationship_topic", "emotional_support"],
-      "optional_intents": ["emotional_support"],
-      "must_activate_keywords": ["李娜"],
-      "forbidden_phrases_in_reply": ["听起来", "我能感受到"]
-    },
-    "tags": ["relationship", "post_intro"]
-  },
-  {
-    "id": "smoke-005-emotional-support-introvert",
+    "id": "smoke-002-casual-introvert-no-probing",
     "personality": "introvert",
     "history": [],
-    "user": "今天有点累",
+    "user": "嗨",
     "expected": {
-      "intents": ["emotional_support"],
-      "forbidden_phrases_in_reply": ["听起来", "我能感受到", "你可以告诉我"]
+      "intents": ["casual"],
+      "optional_intents": ["self_summary"],
+      "forbidden_phrases_in_reply": ["[出错", "你最近怎么样", "和我说说", "聊聊吧"]
     },
-    "tags": ["emotional_support", "introvert"]
+    "tags": ["casual", "introvert", "personality_voice"]
   },
   {
-    "id": "smoke-006-knowledge-task",
-    "personality": "balanced",
+    "id": "smoke-003-casual-extrovert",
+    "personality": "extrovert",
     "history": [],
-    "user": "Python 里 list 和 tuple 的区别是什么",
+    "user": "今天天气真不错",
     "expected": {
-      "intents": ["knowledge_task"],
-      "must_contain": ["可变", "list"]
+      "intents": ["casual"],
+      "forbidden_phrases_in_reply": ["[出错"]
     },
-    "tags": ["knowledge_task"]
+    "tags": ["casual", "extrovert"]
   },
   {
-    "id": "smoke-007-self-summary",
+    "id": "smoke-004-self-summary-balanced",
     "personality": "balanced",
     "history": [
-      {"role": "user", "content": "我叫张三，老家湖南怀化，做后端的"},
+      {"role": "user", "content": "我叫张三,老家湖南怀化,做后端的"},
       {"role": "assistant", "content": "记下来啦。"}
     ],
     "user": "总结一下我自己",
@@ -90,14 +45,61 @@
       "intents": ["self_summary"],
       "must_activate_keywords": ["张三", "怀化"]
     },
-    "tags": ["self_summary"]
+    "tags": ["self_summary", "hard_rule"]
   },
   {
-    "id": "smoke-008-fabrication-guard",
+    "id": "smoke-005-self-summary-introvert",
+    "personality": "introvert",
+    "history": [
+      {"role": "user", "content": "我叫李四,在北京做设计"},
+      {"role": "assistant", "content": "嗯。"}
+    ],
+    "user": "聊聊我自己",
+    "expected": {
+      "intents": ["self_summary"],
+      "must_activate_keywords": ["李四"],
+      "forbidden_phrases_in_reply": ["你还有什么想说的", "再多说说"]
+    },
+    "tags": ["self_summary", "introvert", "hard_rule"]
+  },
+  {
+    "id": "smoke-006-memory-challenge-hometown",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我叫张三,老家湖南怀化"},
+      {"role": "assistant", "content": "记下来啦,张三老家在湖南怀化。"}
+    ],
+    "user": "你还记得我老家在哪儿吗",
+    "expected": {
+      "intents": ["memory_challenge"],
+      "must_activate_keywords": ["怀化"],
+      "forbidden_phrases_in_reply": ["[出错"]
+    },
+    "tags": ["memory_challenge", "hard_rule"]
+  },
+  {
+    "id": "smoke-007-memory-challenge-multi-turn",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我叫王五"},
+      {"role": "assistant", "content": "好的,王五。"},
+      {"role": "user", "content": "我在杭州工作"},
+      {"role": "assistant", "content": "记下来,你在杭州。"}
+    ],
+    "user": "你还记得我在哪儿工作吗",
+    "expected": {
+      "intents": ["memory_challenge"],
+      "must_activate_keywords": ["杭州"],
+      "forbidden_phrases_in_reply": ["北京", "上海", "深圳", "广州"]
+    },
+    "tags": ["memory_challenge", "multi_turn", "fabrication_check"]
+  },
+  {
+    "id": "smoke-008-memory-challenge-no-fabrication",
     "personality": "balanced",
     "history": [
       {"role": "user", "content": "我家有只猫"},
-      {"role": "assistant", "content": "好的，知道你家有猫。"}
+      {"role": "assistant", "content": "好的,知道你家有猫。"}
     ],
     "user": "你忘了我们家养的什么了吗",
     "expected": {
@@ -106,5 +108,167 @@
       "forbidden_phrases_in_reply": ["小鹏", "狗", "我没注意到", "你可以告诉我"]
     },
     "tags": ["memory_challenge", "fabrication_check"]
+  },
+  {
+    "id": "smoke-009-memory-challenge-empty-history",
+    "personality": "balanced",
+    "history": [],
+    "user": "你还记得我老家在哪儿吗",
+    "expected": {
+      "intents": ["memory_challenge"],
+      "forbidden_phrases_in_reply": ["北京", "上海", "湖南", "怀化", "杭州"]
+    },
+    "tags": ["memory_challenge", "empty_history", "fabrication_check"]
+  },
+  {
+    "id": "smoke-010-correction-hometown",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我老家湖南怀化"},
+      {"role": "assistant", "content": "怀化的米粉挺有名。"}
+    ],
+    "user": "不对,是怀宁,邻近安徽岳西",
+    "expected": {
+      "intents": ["correction"],
+      "must_contain": ["怀宁"],
+      "forbidden_phrases_in_reply": ["怀化", "已记录", "我会注意"]
+    },
+    "tags": ["correction", "geo", "hard_rule"]
+  },
+  {
+    "id": "smoke-011-correction-relationship",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我老婆叫李娜"},
+      {"role": "assistant", "content": "好的,记下来李娜是你的老婆。"}
+    ],
+    "user": "不对,她是我女朋友",
+    "expected": {
+      "intents": ["correction"],
+      "must_contain": ["女朋友"],
+      "forbidden_phrases_in_reply": ["老婆", "已记录"]
+    },
+    "tags": ["correction", "relationship", "hard_rule"]
+  },
+  {
+    "id": "smoke-012-correction-denial",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "你今天加班了吗"},
+      {"role": "assistant", "content": "我是 AI 不会加班。你呢?"}
+    ],
+    "user": "我没说过",
+    "expected": {
+      "intents": ["correction"],
+      "forbidden_phrases_in_reply": ["[出错"]
+    },
+    "tags": ["correction", "denial", "hard_rule"]
+  },
+  {
+    "id": "smoke-013-relationship-spouse",
+    "personality": "extrovert",
+    "history": [
+      {"role": "user", "content": "我妻子叫李娜"},
+      {"role": "assistant", "content": "李娜,记下来啦。"}
+    ],
+    "user": "我妻子最近工作有点累",
+    "expected": {
+      "intents": ["relationship_topic"],
+      "optional_intents": ["emotional_support"],
+      "must_activate_keywords": ["李娜"],
+      "forbidden_phrases_in_reply": ["听起来", "我能感受到"]
+    },
+    "tags": ["relationship_topic", "spouse", "hard_rule"]
+  },
+  {
+    "id": "smoke-014-relationship-son",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我儿子小阳今年 10 岁"},
+      {"role": "assistant", "content": "记下来,小阳 10 岁。"}
+    ],
+    "user": "我儿子最近迷上了乐高",
+    "expected": {
+      "intents": ["relationship_topic"],
+      "must_activate_keywords": ["小阳"],
+      "forbidden_phrases_in_reply": ["[出错"]
+    },
+    "tags": ["relationship_topic", "child", "hard_rule"]
+  },
+  {
+    "id": "smoke-015-emotional-support-introvert",
+    "personality": "introvert",
+    "history": [],
+    "user": "我好累",
+    "expected": {
+      "intents": ["emotional_support"],
+      "forbidden_phrases_in_reply": ["听起来", "我能感受到", "你可以告诉我", "不如你"]
+    },
+    "tags": ["emotional_support", "introvert", "hard_rule"]
+  },
+  {
+    "id": "smoke-016-emotional-support-balanced",
+    "personality": "balanced",
+    "history": [],
+    "user": "心情不好",
+    "expected": {
+      "intents": ["emotional_support"],
+      "forbidden_phrases_in_reply": ["[出错", "我很抱歉", "请允许我"]
+    },
+    "tags": ["emotional_support", "hard_rule"]
+  },
+  {
+    "id": "smoke-017-plan-followup-fitness",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我决定每天跑步 30 分钟"},
+      {"role": "assistant", "content": "好计划,加油。"}
+    ],
+    "user": "我已经坚持 5 天了",
+    "expected": {
+      "intents": ["plan_followup"],
+      "optional_intents": ["casual"],
+      "forbidden_phrases_in_reply": ["[出错"]
+    },
+    "tags": ["plan_followup", "small_model"]
+  },
+  {
+    "id": "smoke-018-preference-request-with-profile",
+    "personality": "balanced",
+    "history": [
+      {"role": "user", "content": "我喜欢爬山,周末经常去户外"},
+      {"role": "assistant", "content": "记下你喜欢爬山。"}
+    ],
+    "user": "周末有什么放松方式推荐",
+    "expected": {
+      "intents": ["preference_request"],
+      "optional_intents": ["casual"],
+      "forbidden_phrases_in_reply": ["[出错"]
+    },
+    "tags": ["preference_request", "small_model"]
+  },
+  {
+    "id": "smoke-019-knowledge-task-python",
+    "personality": "balanced",
+    "history": [],
+    "user": "Python 里 list 和 tuple 的区别是什么",
+    "expected": {
+      "intents": ["knowledge_task"],
+      "optional_intents": ["casual"],
+      "must_contain": ["可变", "list"]
+    },
+    "tags": ["knowledge_task", "tech", "small_model"]
+  },
+  {
+    "id": "smoke-020-knowledge-task-extrovert",
+    "personality": "extrovert",
+    "history": [],
+    "user": "什么是 HTTP 状态码 200",
+    "expected": {
+      "intents": ["knowledge_task"],
+      "optional_intents": ["casual"],
+      "must_contain": ["200", "成功"]
+    },
+    "tags": ["knowledge_task", "tech", "extrovert", "small_model"]
   }
 ]

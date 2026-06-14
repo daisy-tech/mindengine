@@ -207,6 +207,9 @@ def build_chat_orchestrator_factory(request: Request):
             guard=state.contract_guard,
             chat_llm=state.llm_router.for_role(LLMRole.CHAT),
             dispatcher=state.task_dispatcher,
+            # prompt_archive 在 lifespan 里按 settings.prompt_archive_dir
+            # 创建;为空字符串时不注入,orchestrator 默认 None 即不落盘。
+            prompt_archive=getattr(state, "prompt_archive", None),
         )
 
     return make

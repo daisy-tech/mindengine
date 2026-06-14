@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from pathlib import Path
 
 from fastapi import FastAPI
 from openai import AsyncOpenAI
@@ -36,11 +37,13 @@ from app.infra.llm.mock_client import MockEmbeddingClient
 from app.infra.llm.qwen_client import QwenClient
 from app.infra.tasks import CeleryDispatcher, InMemoryDispatcher
 from app.services.contract_guard import ContractGuard
+from app.services.eval_synthetic import ChatBackedSyntheticRunner
 from app.services.memory_router import (
     InMemoryIntentCache,
     LLMIntentClassifier,
     MemoryRouter,
 )
+from app.services.prompt_archive import FilesystemPromptArchive
 from app.services.prompt_composer import PromptComposer
 
 
@@ -75,6 +78,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.contract_guard = ContractGuard()
     app.state.task_dispatcher = _build_dispatcher(settings)
     app.state.embedder = _build_embedder(settings)
+
+    # 旁路 prompt 归档(供「查看完整 system + user + reply」用)。
+    # settings.prompt_archive_dir 为空字符串时关闭;非空时落盘到该目录。
+    archive_dir = (settings.prompt_archive_dir or "").strip()
+    if archive_dir:
+        app.state.prompt_archive = FilesystemPromptArchive(root=Path(archive_dir))
+    else:
+        app.state.prompt_archive = None
+
+    # Synthetic eval runner (doc 07 §2.3). Single instance per process —
+    # pure plumbing on top of router/composer/llm, no per-request state.
+    app.state.synthetic_runner = ChatBackedSyntheticRunner(
+        router=memory_router,
+        composer=app.state.prompt_composer,
+        chat_llm=llm_router.for_role(LLMRole.CHAT),
+        eval_user_id=settings.eval_user_id,
+    )
 
     # NOTE: ChatOrchestrator is constructed PER REQUEST in api.chat because
     # its MemoryContextLoader depends on per-user, per-session repos.

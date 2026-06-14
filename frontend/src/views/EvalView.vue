@@ -2,16 +2,21 @@
 import { onMounted, ref } from 'vue';
 import {
   deleteChatAudit,
+  deleteStoredSynthetic,
   getChatAudit,
+  getStoredSynthetic,
   listChatAuditStored,
+  listStoredSynthetic,
   listSynthetic,
   startSynthetic,
   type CaseFileInfo,
   type ChatAuditReview,
   type StoredReviewSummary,
+  type StoredSyntheticSummary,
   type SyntheticReport,
 } from '@/api/eval';
 import { listConversations, type ConversationDTO } from '@/api/conversations';
+import SyntheticReportView from '@/components/SyntheticReportView.vue';
 
 const cases = ref<CaseFileInfo[]>([]);
 const stored = ref<StoredReviewSummary[]>([]);
@@ -22,16 +27,21 @@ const reviewingId = ref('');
 const runningCase = ref('');
 const reviewLoading = ref(false);
 
+const storedSynth = ref<StoredSyntheticSummary[]>([]);
+const viewingRunId = ref('');
+
 async function refreshAll() {
   try {
-    const [cs, st, convs] = await Promise.all([
+    const [cs, st, convs, ss] = await Promise.all([
       listSynthetic(),
       listChatAuditStored(),
       listConversations(),
+      listStoredSynthetic(),
     ]);
     cases.value = cs;
     stored.value = st;
     conversations.value = convs;
+    storedSynth.value = ss;
   } catch (e) {
     console.error(e);
     ElMessage.error('加载评测数据失败');
@@ -42,9 +52,23 @@ onMounted(refreshAll);
 
 async function runCase(name: string) {
   runningCase.value = name;
+  // Smoke ≈ 1~2 分钟,full ≈ 3~6 分钟,UI 一直没反馈用户会以为卡死,
+  // 这里给一个不消失的 loading message,跑完后手动关掉。
+  const loadingMsg = ElMessage({
+    message: `${name} 评测进行中,LLM 串行跑全部 case,大约 1~6 分钟,请勿关闭页面…`,
+    type: 'info',
+    duration: 0,
+    showClose: true,
+  });
   try {
     lastReport.value = await startSynthetic(name);
-    ElMessage.success(`合成评测完成：${lastReport.value.passed}/${lastReport.value.total}`);
+    viewingRunId.value = lastReport.value.run_id;
+    ElMessage.success(
+      `${name} 评测完成:${lastReport.value.passed}/${lastReport.value.total} 通过 ` +
+        `(${(lastReport.value.pass_rate * 100).toFixed(1)}%) · 已自动保存`,
+    );
+    // 跑完后刷新历史列表,新 run_id 立刻出现在「历史评测」里。
+    storedSynth.value = await listStoredSynthetic();
   } catch (e: unknown) {
     const detail =
       e && typeof e === 'object' && 'response' in e
@@ -54,6 +78,45 @@ async function runCase(name: string) {
     ElMessage.error(detail || '评测失败');
   } finally {
     runningCase.value = '';
+    loadingMsg.close();
+  }
+}
+
+async function viewStoredRun(runId: string) {
+  try {
+    lastReport.value = await getStoredSynthetic(runId);
+    viewingRunId.value = runId;
+    ElMessage.success('已加载该次评测结果');
+  } catch (e) {
+    console.error(e);
+    ElMessage.error('加载失败');
+  }
+}
+
+async function dropStoredRun(runId: string) {
+  await ElMessageBox.confirm('删除这次评测的落盘报告?不影响历史/当前会话。', '确认', {
+    confirmButtonText: '删除',
+    cancelButtonText: '取消',
+    type: 'warning',
+  })
+    .then(async () => {
+      await deleteStoredSynthetic(runId);
+      ElMessage.success('已删除');
+      if (viewingRunId.value === runId) {
+        lastReport.value = null;
+        viewingRunId.value = '';
+      }
+      storedSynth.value = await listStoredSynthetic();
+    })
+    .catch(() => undefined);
+}
+
+function fmtFinishedAt(s: string): string {
+  if (!s) return '—';
+  try {
+    return new Date(s).toLocaleString('zh-CN', { hour12: false });
+  } catch {
+    return s;
   }
 }
 
@@ -114,20 +177,50 @@ async function dropStored(id: string) {
           </div>
         </div>
 
-        <div v-if="lastReport" class="card" style="margin-top:18px">
-          <h3 style="margin:0;color:var(--xb-purple-dark)">
-            上次结果 · {{ lastReport.run_type }}
+        <div v-if="storedSynth.length" class="card" style="margin-top:18px">
+          <h3 style="margin:0 0 8px;color:var(--xb-purple-dark)">
+            历史评测 · {{ storedSynth.length }}
           </h3>
-          <div style="margin:6px 0;color:var(--xb-muted)">
-            通过率 <strong>{{ (lastReport.pass_rate * 100).toFixed(1) }}%</strong>
-            （{{ lastReport.passed }}/{{ lastReport.total }}）
-          </div>
-          <details>
-            <summary style="cursor:pointer">展开 case-by-case</summary>
-            <pre style="font-size:11px;max-height:280px;overflow:auto">
-{{ JSON.stringify(lastReport.cases, null, 2) }}
-            </pre>
-          </details>
+          <p style="color:var(--xb-muted);font-size:12px;margin:0 0 8px">
+            每次跑完会自动保存,点「查看」立刻浏览,无需重跑
+          </p>
+          <el-table :data="storedSynth" size="small" stripe>
+            <el-table-column prop="run_type" label="用例集" width="140" />
+            <el-table-column label="完成时间" width="200">
+              <template #default="{ row }">{{ fmtFinishedAt(row.finished_at) }}</template>
+            </el-table-column>
+            <el-table-column label="通过率" width="120">
+              <template #default="{ row }">
+                <span
+                  :class="{
+                    'rate-good': row.pass_rate >= 0.85,
+                    'rate-bad': row.pass_rate < 0.7,
+                  }"
+                >
+                  {{ (row.pass_rate * 100).toFixed(1) }}% ({{ row.passed }}/{{ row.total }})
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="run_id" label="run_id" />
+            <el-table-column label="操作" width="160">
+              <template #default="{ row }">
+                <el-button
+                  size="small"
+                  :type="viewingRunId === row.run_id ? 'success' : 'primary'"
+                  @click="viewStoredRun(row.run_id)"
+                >
+                  {{ viewingRunId === row.run_id ? '当前' : '查看' }}
+                </el-button>
+                <el-button size="small" type="danger" link @click="dropStoredRun(row.run_id)">
+                  删除
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+
+        <div v-if="lastReport" style="margin-top:18px">
+          <SyntheticReportView :report="lastReport" />
         </div>
       </el-tab-pane>
 

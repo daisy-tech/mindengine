@@ -68,6 +68,26 @@ class FakeEventRepo:
             if e.id == event_id:
                 e.status = "deprecated"
 
+    async def find_similar_recent(
+        self,
+        *,
+        type_: str,
+        title: str,
+        within_days: int = 30,
+    ) -> Event | None:
+        # Fake 端只实现"完全相等(归一)"逻辑;真实 repo 还会做子串匹配。
+        # 测试 worker 去重路径时,精确等于已经能覆盖关键回归。
+        _ = within_days
+        norm = (title or "").strip().lower()
+        for e in self.rows:
+            if e.status != "active":
+                continue
+            if e.type != type_:
+                continue
+            if (e.title or "").strip().lower() == norm:
+                return e
+        return None
+
 
 @dataclass
 class FakeEpisodicRepo:
@@ -85,6 +105,21 @@ class FakeEpisodicRepo:
     async def search(self, query: str, *, limit: int = 10) -> list[EpisodicHit]:
         _ = query
         return list(self.search_results[:limit])
+
+    async def find_similar(
+        self,
+        text: str,
+        *,
+        threshold: float = 0.90,
+    ) -> EpisodicHit | None:
+        # Test seam: 测试用 search_results[0] 当作"最近邻",阈值过滤交给真实代码逻辑。
+        # 真实库版本走 pgvector ANN;fake 这里足够覆盖 worker 的去重分支。
+        if not self.search_results:
+            return None
+        top = self.search_results[0]
+        if top.score < threshold:
+            return None
+        return top
 
     async def soft_delete(self, mem_id: str, reason: str) -> None:
         _ = reason
@@ -198,6 +233,16 @@ class FakeConversationRepo:
         if row is None:
             return
         row.updated_at = when or datetime.now(UTC)
+
+    async def set_title_if_empty(self, conversation_id: str, title: str) -> bool:
+        row = self.rows.get(conversation_id)
+        if row is None or row.title:
+            return False
+        cleaned = (title or "").strip()
+        if not cleaned:
+            return False
+        row.title = cleaned[:80]
+        return True
 
 
 @dataclass

@@ -32,12 +32,26 @@ class CaseLoadError(RuntimeError):
 
 
 def load_cases(path: str | Path) -> list[EvalCase]:
-    """Load every case in ``path``. Raises ``CaseLoadError`` on bad data."""
+    """Load every case in ``path``. Raises ``CaseLoadError`` on bad data.
+
+    All on-disk failure modes (missing file, IO error, non-UTF-8 bytes,
+    invalid JSON, schema mismatch) are normalized to :class:`CaseLoadError`
+    so callers like ``api.eval.list_synthetic`` can rely on a single
+    catch and convert the rest into 404 / silent skip.
+    """
     p = Path(path)
     if not p.exists():
         raise CaseLoadError(f"case file not found: {p}")
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # AppleDouble (`._*`) on NFS, BOM-mangled files, etc. Treat as
+        # malformed so the caller can skip the file instead of 500-ing.
+        raise CaseLoadError(f"non-UTF-8 bytes in {p}: {exc}") from exc
+    except OSError as exc:
+        raise CaseLoadError(f"cannot read {p}: {exc}") from exc
+    try:
+        raw = json.loads(text)
     except json.JSONDecodeError as exc:
         raise CaseLoadError(f"invalid JSON in {p}: {exc}") from exc
 
@@ -56,11 +70,17 @@ def load_cases(path: str | Path) -> list[EvalCase]:
 
 
 def list_case_files(directory: str | Path) -> list[Path]:
-    """Return every ``*.json`` under ``directory`` in a stable order."""
+    """Return every visible ``*.json`` under ``directory`` in a stable order.
+
+    Skips dotfiles like macOS AppleDouble metadata (``._foo.json``) that
+    sneak in via NFS shares — these are valid ``*.json`` per glob but
+    are AppleDouble binary, not JSON, and would otherwise blow up
+    ``load_cases``.
+    """
     d = Path(directory)
     if not d.exists():
         return []
-    return sorted(d.glob("*.json"))
+    return sorted(p for p in d.glob("*.json") if not p.name.startswith("."))
 
 
 def load_named_set(directory: str | Path, name: str) -> list[EvalCase]:
